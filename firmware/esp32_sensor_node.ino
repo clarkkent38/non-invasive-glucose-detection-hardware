@@ -54,9 +54,36 @@
 // SSD1306 OLED uses the same I2C bus as MAX30102 + TMP117 (addr 0x3C)
 // No extra pins needed — just wire SDA/SCL/VCC/GND
 
+// ── pH-4502C Module Wiring ───────────────────────────────────────────────────
+// Pin header (top to bottom): To  Do  Po  G  V+
+//   V+  → ESP32 5V pin     (module needs 5V, NOT 3.3V)
+//   G   → GND
+//   Po  → voltage divider → GPIO4  (Po can output up to 3.5V — MUST divide!)
+//   Do  → not connected   (digital threshold output, unused)
+//   To  → not connected   (NTC thermistor output, unused)
+//
+// REQUIRED voltage divider on Po pin (protects ESP32 ADC from >3.3V):
+//
+//   Po ──[10kΩ]──┬──── GPIO4
+//                [10kΩ]
+//                │
+//               GND
+//
+// This halves the Po voltage: 0–5V becomes 0–2.5V at GPIO4 (safe for ESP32)
+// The calibration formula below already accounts for the 2× divider factor.
+//
 // ── pH Calibration ───────────────────────────────────────────────────────────
-#define PH_SLOPE      -0.0017f   // replace after calibration with pH 4/7 buffers
-#define PH_INTERCEPT   14.0f     // replace after calibration
+// The pH-4502C outputs ~2.5V at pH 7.0.
+// With the 1:2 voltage divider, GPIO4 sees ~1.25V (ADC raw ~1550 at 12-bit).
+// Calibrate with pH 4.0 and pH 7.0 buffer solutions:
+//   1. Dip probe in pH 7.0 buffer → note raw ADC from Serial Monitor
+//   2. Dip probe in pH 4.0 buffer → note raw ADC
+//   3. Calculate:
+//      PH_SLOPE     = (7.0 - 4.0) / (adc_at_7 - adc_at_4)
+//      PH_INTERCEPT = 7.0 - PH_SLOPE * adc_at_7
+// Default values are approximate — REPLACE with your measured values.
+#define PH_SLOPE      -0.0034f   // approx for 4502C with 1:2 divider
+#define PH_INTERCEPT   12.26f    // approx for 4502C with 1:2 divider
 
 // ── Timing ───────────────────────────────────────────────────────────────────
 #define PPG_COLLECT_MS   5000
@@ -510,8 +537,18 @@ float collectPH() {
   }
   std::sort(samples, samples + N);
   int medianRaw = (samples[N/2 - 1] + samples[N/2]) / 2;
+
+  // Voltage at GPIO4 (after 1:2 divider): raw * 3.3 / 4095
+  // Actual Po voltage from module: GPIO4_voltage * 2
+  float gpio4V  = medianRaw * (3.3f / 4095.0f);
+  float moduleV = gpio4V * 2.0f;  // undo the 1:2 divider
   float ph = PH_SLOPE * medianRaw + PH_INTERCEPT;
-  Serial.printf("\n  [pH] Raw median ADC=%d  → pH=%.3f\n", medianRaw, ph);
+
+  Serial.printf("\n  [pH] Median ADC = %d\n", medianRaw);
+  Serial.printf("  [pH] GPIO4 voltage  = %.3f V\n", gpio4V);
+  Serial.printf("  [pH] Module Po volt = %.3f V  (after undoing divider)\n", moduleV);
+  Serial.printf("  [pH] Calculated pH  = %.3f\n", ph);
+  Serial.println("  [pH] NOTE: Use pH 4/7 buffers to calibrate PH_SLOPE & PH_INTERCEPT");
   return ph;
 }
 
