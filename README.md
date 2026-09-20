@@ -42,11 +42,61 @@ streamlit run app/dashboard.py
 
 ---
 
+## ☁️ Streamlit Cloud Deployment
+
+### Step 1 — Deploy the app
+
+1. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**
+2. Set these fields exactly:
+
+   | Field | Value |
+   |---|---|
+   | Repository | `clarkkent38/non-invasive-glucose-detection-hardware` |
+   | Branch | `main` |
+   | **Main file path** | **`streamlit_app.py`** |
+
+   > `streamlit_app.py` at the repo root delegates to `app/live_dashboard.py` automatically.
+
+### Step 2 — Add Supabase secrets
+
+Before clicking Deploy, open **Advanced settings → Secrets** and paste:
+
+```toml
+[supabase]
+url = "https://mjcwhnkyojfaezydvpsp.supabase.co"
+key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1qY3dobmt5b2pmYWV6eWR2cHNwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk4NzA5MTYsImV4cCI6MjEwNTQ0NjkxNn0.G1nM1QYYztA2DStOOQ2qOD2Y7RP2n4KnaQKYe1WeVFM"
+```
+
+> The key above is the **anon/public** JWT — safe to use in client-side apps.
+> Never add your `sb_secret_...` key here or anywhere in the codebase.
+
+### Step 3 — Local development
+
+```bash
+# Copy secrets template (gitignored — never committed)
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+
+# Run live sensor dashboard
+streamlit run streamlit_app.py
+
+# Or run the original manual dashboard
+streamlit run app/dashboard.py
+```
+
+---
+
 ## 📋 Repository Structure
 
 ```
+├── streamlit_app.py          # Streamlit Cloud entry point (delegates to live_dashboard.py)
 ├── app/
-│   └── dashboard.py          # Interactive Streamlit Web Application
+│   ├── dashboard.py          # Original manual-entry dashboard
+│   ├── live_dashboard.py     # Live sensor dashboard (ESP32 → Supabase → predictions)
+│   └── supabase_client.py    # Supabase helper
+├── firmware/
+│   └── esp32_sensor_node.ino # ESP32-S3 firmware (MAX30102 + TMP117 + pH + ST7789 display)
+├── supabase/
+│   └── schema.sql            # Database schema — run once in Supabase SQL editor
 ├── models/
 │   ├── production_model_full_sensor.pkl
 │   ├── quantile_regressor_full_sensor.pkl
