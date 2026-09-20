@@ -49,15 +49,28 @@
 #define DEVICE_ID         "esp32_node_01"
 
 // ── Pin Configuration ────────────────────────────────────────────────────────
-#define I2C_SDA     8
-#define I2C_SCL     9
-#define TFT_SCL    18
-#define TFT_SDA    23
-#define TFT_RES     2
-#define TFT_DC     15
-#define TFT_BLK    21
-#define PH_ADC_PIN  4
-#define BUTTON_PIN  0
+// Board: ESP32-S3 DevKitC 1  (mischianti.org pinout)
+//
+// I2C — shared bus for MAX30102 (0x57) and TMP117 (0x48)
+#define I2C_SDA     8    // labelled SDA on board left-side row
+#define I2C_SCL     9    // labelled SCL on board left-side row (FSPIHD)
+//
+// SPI — ST7789 240×240 TFT display
+// Note: GPIO23 / GPIO18 are regular GPIOs on S3 (not strapped, not USB)
+#define TFT_SCL    18    // SPI clock   — GPIO18 (FSPIC LK / SCK)
+#define TFT_SDA    23    // SPI MOSI    — GPIO23 (MOSI)
+#define TFT_RES     2    // Reset       — GPIO2  (RTC GPIO2)
+#define TFT_DC     15    // Data/Cmd    — GPIO15 (safe general GPIO)
+#define TFT_BLK    21    // Backlight   — GPIO21 (RTC GPIO21, safe)
+//
+// Analog input — pH signal-conditioning module (0–3.3 V output)
+#define PH_ADC_PIN  4    // GPIO4 = ADC1_3, no strapping role
+//
+// Tactile button — active LOW, internal pull-up enabled in firmware
+// ⚠️  GPIO0 is the BOOT button (strapping pin): LOW at power-on = flash mode.
+//     Using it as a user button risks accidentally entering bootloader
+//     if held during power-up.  Moved to GPIO14 (ADC2_3, no special role).
+#define BUTTON_PIN 14    // GPIO14 — safe general input, no strapping function
 
 // ── pH Calibration ───────────────────────────────────────────────────────────
 // Measure ADC at pH 4.0 and pH 7.0 buffer solutions, then calculate:
