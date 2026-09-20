@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -48,6 +49,142 @@ st.set_page_config(
 )
 
 # ── shared CSS (same palette as dashboard.py) ─────────────────────────────────
+st.html("""
+<style>
+    .glucose-card {
+        background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+        border-radius: 15px;
+        border: 2px solid #64748b;
+        padding: 20px;
+        margin: 15px 0;
+        text-align: center;
+        box-shadow: 0 8px 25px rgba(0,0,0,0.3);
+    }
+    .glucose-normal { border-color: #22c55e !important; }
+    .glucose-prediabetic { border-color: #f59e0b !important; }
+    .glucose-diabetic { border-color: #ef4444 !important; }
+    .metric-card { 
+        background: #1e293b; 
+        border: 1px solid #475569; 
+        border-radius: 10px;
+        padding: 15px; 
+        margin: 8px 0;
+        text-align: center;
+    }
+    .sensor-value { font-size: 1.2em; font-weight: bold; color: #e2e8f0; }
+    .sensor-unit { font-size: 0.9em; color: #94a3b8; margin-left: 5px; }
+    .ts-small { font-size: 0.85em; color: #94a3b8; }
+    .esp32-status {
+        background: #0f172a;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 12px;
+        margin: 10px 0;
+    }
+    .status-online { border-color: #22c55e !important; }
+    .status-offline { border-color: #ef4444 !important; }
+    .status-reading { border-color: #3b82f6 !important; }
+</style>
+""")
+
+# ── ESP32 Device Control Functions ──────────────────────────────────────────
+def get_esp32_status(device_ip: str) -> Dict[str, Any]:
+    """Get ESP32 device status via HTTP"""
+    try:
+        response = requests.get(f"http://{device_ip}/status", timeout=5)
+        if response.status_code == 200:
+            return {"online": True, "data": response.json()}
+        else:
+            return {"online": False, "error": f"HTTP {response.status_code}"}
+    except requests.exceptions.RequestException as e:
+        return {"online": False, "error": str(e)}
+
+def trigger_esp32_reading(device_ip: str) -> Dict[str, Any]:
+    """Trigger a new sensor reading on ESP32"""
+    try:
+        response = requests.post(f"http://{device_ip}/start_reading", timeout=10)
+        if response.status_code == 200:
+            return {"success": True, "data": response.json()}
+        elif response.status_code == 409:
+            return {"success": False, "error": "Reading already in progress"}
+        else:
+            return {"success": False, "error": f"HTTP {response.status_code}"}
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "error": str(e)}
+
+def render_esp32_control_panel(sb):
+    """Render ESP32 device control panel"""
+    st.markdown("#### 📡 ESP32 Device Control")
+    
+    # Device IP input (saved in session state)
+    if "esp32_ip" not in st.session_state:
+        st.session_state.esp32_ip = "192.168.1.100"  # Default IP
+    
+    col_ip, col_status, col_trigger = st.columns([2, 2, 2])
+    
+    with col_ip:
+        device_ip = st.text_input("ESP32 IP Address:", 
+                                 value=st.session_state.esp32_ip,
+                                 key="esp32_ip_input",
+                                 help="Enter the ESP32's local network IP address")
+        st.session_state.esp32_ip = device_ip
+    
+    with col_status:
+        check_status_btn = st.button("🔍 Check Device Status")
+        
+    with col_trigger:
+        trigger_reading_btn = st.button("🚀 Start Remote Reading", type="primary")
+    
+    # Status display
+    if check_status_btn or "esp32_status" not in st.session_state:
+        with st.spinner(f"Checking device at {device_ip}..."):
+            status = get_esp32_status(device_ip)
+            st.session_state.esp32_status = status
+    
+    if "esp32_status" in st.session_state:
+        status = st.session_state.esp32_status
+        
+        if status["online"]:
+            data = status["data"]
+            status_class = "status-reading" if data.get("reading_in_progress") else "status-online"
+            
+            st.markdown(f"""
+            <div class="esp32-status {status_class}">
+                <strong>🟢 Device Online</strong> — {device_ip}<br>
+                Device ID: {data.get('device_id', '—')}<br>
+                Reading in progress: {"Yes" if data.get('reading_in_progress') else "No"}<br>
+                WiFi: {"Connected" if data.get('wifi_connected') else "Disconnected"}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="esp32-status status-offline">
+                <strong>🔴 Device Offline</strong><br>
+                Error: {status.get('error', 'Unknown error')}<br>
+                Check IP address and network connection
+            </div>
+            """, unsafe_allow_html=True)
+    
+    # Remote reading trigger
+    if trigger_reading_btn:
+        if "esp32_status" not in st.session_state or not st.session_state.esp32_status["online"]:
+            st.error("❌ Cannot trigger reading: Device is offline. Check device status first.")
+        else:
+            with st.spinner(f"Triggering reading on {device_ip}..."):
+                result = trigger_esp32_reading(device_ip)
+                
+                if result["success"]:
+                    st.success("✅ Reading started successfully! The ESP32 will collect sensor data and upload to Supabase.")
+                    st.info("💡 **Tip:** Wait 10-15 seconds, then click 'Fetch Latest Reading' to see the new data.")
+                    # Clear cached status to force refresh
+                    if "esp32_status" in st.session_state:
+                        del st.session_state.esp32_status
+                else:
+                    st.error(f"❌ Failed to start reading: {result['error']}")
+    
+    st.markdown("---")
+
+# ── original CSS (combined above) ─────────────────────────────────────────────
 st.markdown("""
 <style>
   .main-title  { font-size:2.1rem; font-weight:800; color:#1e3a8a; }
@@ -190,6 +327,9 @@ if is_live:
                 st_autorefresh(interval=30_000, key="live_autorefresh")
         except ImportError:
             st.caption("*(install streamlit-autorefresh to enable auto-refresh)*")
+
+    # ── ESP32 Device Control Panel ────────────────────────────────────────────
+    render_esp32_control_panel(sb)
 
     # ── Fetch reading ─────────────────────────────────────────────────────────
     # Fetch on button press OR on first load (session_state["live_reading"] absent)

@@ -10,3 +10,4 @@ plotly>=5.18.0
 supabase==2.15.0            # Supabase Python client (REST + realtime)
 gotrue==2.12.0              # supabase-py peer dependency (auth)
 streamlit-autorefresh==1.0.1  # optional: auto-refresh for live sensor mode
+requests>=2.31.0            # HTTP requests for ESP32 device control

@@ -68,10 +68,12 @@ project files:
 ```
 
 3. Install the required libraries via **Tools → Manage Libraries**:
+   - `Adafruit ST7789` (for TFT display)
+   - `Adafruit GFX Library` (graphics support)  
    - `SparkFun MAX3010x Pulse and Proximity Sensor Library`
    - `SparkFun TMP117`
    - `ArduinoJson` (version 6.x)
-   - WiFi and HTTPClient are built into the ESP32 board package.
+   - WiFi, HTTPClient, and WebServer are built into the ESP32 board package.
 
 4. Select board: **Tools → Board → esp32 → ESP32S3 Dev Module**
 
@@ -91,63 +93,100 @@ project files:
 
 ---
 
-## Step 4 — Sensor Wiring Reference
+## Step 4 — Hardware Wiring (Updated with Display)
 
-All three sensors share the same I2C bus. Wire them as follows:
+This system now includes an interactive ST7789 TFT display that shows 
+real-time sensor readings and progress.
 
-### I2C Bus (shared by MAX30102 and TMP117)
+### Complete Wiring Table
 
-| ESP32-S3 Pin | Signal | MAX30102 Pin | TMP117 Pin |
+| Component | ESP32-S3 Pin | Signal | Notes |
 |---|---|---|---|
-| GPIO 8 | SDA | SDA | SDA |
-| GPIO 9 | SCL | SCL | SCL |
-| 3.3V | Power | VIN / 3.3V | VIN |
-| GND | Ground | GND | GND |
+| **MAX30102** | GPIO 8 | SDA | I2C data |
+| | GPIO 9 | SCL | I2C clock |
+| | 3.3V | VIN | Power |
+| | GND | GND | Ground |
+| **TMP117** | GPIO 8 | SDA | Share I2C bus with MAX30102 |
+| | GPIO 9 | SCL | Share I2C bus |  
+| | 3.3V | VIN | Power |
+| | GND | GND | Ground |
+| **pH Probe Module** | GPIO 4 | VOUT | Analog signal (0-3.3V) |
+| | 3.3V | VCC | Power (if needed) |
+| | GND | GND | Ground |
+| **ST7789 Display** | GPIO 18 | SCL | SPI clock |
+| | GPIO 23 | SDA | SPI data (MOSI) |
+| | GPIO 2 | RES | Reset pin |
+| | GPIO 15 | DC | Data/Command |  
+| | GPIO 21 | BLK | Backlight control |
+| | 3.3V | VCC | Power |
+| | GND | GND | Ground |
+| **Tactile Button** | GPIO 0 | Button | Connect to GND (internal pull-up) |
 
-> Both sensors have fixed I2C addresses: MAX30102 = **0x57**, TMP117 = **0x48**.
-> They coexist on the same bus without conflict.
+### Visual Wiring Diagram
 
-### pH Probe (analog)
+```
+ESP32-S3                     ST7789 Display (240x240)
+┌─────────────┐             ┌─────────────────────────────┐
+│    3.3V  ●──┼─────────────┤ VCC                         │
+│     GND  ●──┼─────────────┤ GND                         │  
+│  GPIO18  ●──┼─────────────┤ SCL (SPI Clock)             │
+│  GPIO23  ●──┼─────────────┤ SDA (SPI Data/MOSI)         │
+│   GPIO2  ●──┼─────────────┤ RES (Reset)                 │
+│  GPIO15  ●──┼─────────────┤ DC  (Data/Command)          │
+│  GPIO21  ●──┼─────────────┤ BLK (Backlight)             │
+│             │             └─────────────────────────────┘
+│             │
+│   GPIO8  ●──┼──┬── MAX30102 (SDA) + TMP117 (SDA) 
+│   GPIO9  ●──┼──┼── MAX30102 (SCL) + TMP117 (SCL)
+│             │  │
+│   GPIO4  ●──┼──┼── pH Probe Signal Conditioner (VOUT)
+│             │  │
+│   GPIO0  ●──┼──┼── Tactile Button (other leg → GND)
+│             │  │
+│    3.3V  ●──┼──┴── Sensor Power (MAX30102, TMP117, pH module)
+│     GND  ●──┼───── Common Ground
+└─────────────┘
+```
 
-| ESP32-S3 Pin | Signal | pH Module Pin |
-|---|---|---|
-| GPIO 4 | Analog input | VOUT / AO |
-| 3.3V | Power (if module needs it) | VCC |
-| GND | Ground | GND |
+### I2C Address Verification
 
-> ⚠️ **Important:** The pH electrode outputs a small millivolt signal. A
-> signal-conditioning module (e.g. using LM324 or similar op-amp) is required
-> to convert it to the 0–3.3V range that the ESP32 ADC accepts. **Never apply
-> more than 3.3V to an ESP32 GPIO.** A simple and inexpensive module is the
-> "Gravity: Analog pH Sensor" by DFRobot, which includes the conditioning
-> circuit.
+Both I2C sensors have fixed addresses and won't conflict:
+- **MAX30102:** I2C address `0x57` 
+- **TMP117:** I2C address `0x48`
 
-### pH Calibration (do this before first use)
+### pH Calibration (Critical Step)
 
-1. In `firmware/esp32_sensor_node.ino` find:
+⚠️ **Must be done before first use:**
+
+1. Get pH buffer solutions: 4.0, 7.0, and 10.0 (available from electronics suppliers)
+2. In firmware, find these calibration constants:
    ```cpp
-   #define PH_SLOPE      -0.0017f
-   #define PH_INTERCEPT  14.0f
+   #define PH_SLOPE      -0.0017f    // Replace with your values
+   #define PH_INTERCEPT  14.0f       // Replace with your values  
    ```
-2. Dip the probe in **pH 7.0 buffer solution**. Note the raw ADC value printed
-   in Serial Monitor: `[pH] ADC=2048  saliva_ph=X.XX`
-3. Dip the probe in **pH 4.0 buffer solution**. Note the ADC value.
-4. Calculate slope and intercept:
+3. Dip probe in **pH 7.0**, note the raw ADC value from Serial Monitor
+4. Dip probe in **pH 4.0**, note the raw ADC value  
+5. Calculate: 
    ```
-   slope     = (7.0 - 4.0) / (adc_at_7 - adc_at_4)
+   slope = (7.0 - 4.0) / (adc_at_7 - adc_at_4)
    intercept = 7.0 - slope * adc_at_7
    ```
-5. Update `PH_SLOPE` and `PH_INTERCEPT` with your computed values, then
-   re-upload the firmware.
-6. Verify with pH 10.0 buffer: the printed value should be ≈ 10.0 ± 0.2.
+6. Update firmware with calculated values and re-upload
+7. Verify with pH 10.0 buffer (should read ≈10.0 ± 0.2)
 
-### Taking a Reading
+### Interactive Operation
 
-Press the **BOOT button (GPIO0)** on the ESP32-S3 development board. The
-firmware will:
-1. Sample PPG for 5 seconds (keep finger still on sensor)
-2. Read temperature
-3. Read pH (average of 16 ADC samples)
+The device now has two ways to trigger readings:
+
+1. **Manual:** Press the tactile button → device runs collection sequence
+2. **Remote:** Use dashboard's "Start Remote Reading" button → device responds via WiFi
+
+The ST7789 display shows:
+- Welcome screen with WiFi status and device IP
+- Step-by-step progress during sensor collection  
+- Final results with all sensor values
+- Upload status (success/error)
+- Beautiful bordered interface like a professional medical device
 4. POST the JSON to Supabase
 
 Serial output on success:
@@ -174,8 +213,18 @@ Serial output on success:
    streamlit run app/live_dashboard.py
    ```
 
-3. Select **🔴 Live Sensor Mode** at the top. Press **Fetch Latest Reading**.
-   The reading taken in Step 4 should appear.
+3. **New Interactive Features:**
+   - Select **🔴 Live Sensor Mode** at the top
+   - **ESP32 Device Control** panel: Enter your ESP32's IP address
+   - **Check Device Status:** Verify ESP32 is online and ready  
+   - **Start Remote Reading:** Trigger sensor collection remotely from dashboard
+   - **Fetch Latest Reading:** Get the newest data from Supabase
+
+4. **Two ways to take readings:**
+   - **Manual:** Press tactile button on ESP32 → watch progress on display
+   - **Remote:** Click "Start Remote Reading" → ESP32 responds automatically
+   
+5. The ESP32 display shows step-by-step progress and results beautifully.
 
 ---
 
