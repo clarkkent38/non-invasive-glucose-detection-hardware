@@ -452,12 +452,48 @@ with tab_live:
                     unsafe_allow_html=True)
         st.markdown("")
 
-        col_done, col_new = st.columns([2, 6])
+        col_done, col_new, col_encyclopedia = st.columns([2, 4, 2])
         with col_done:
             if st.button("✅ Done — Start New Reading", type="primary"):
                 st.session_state.pop("last_result", None)
                 st.session_state.pop("last_pending_row", None)
                 st.rerun()
+        
+        with col_encyclopedia:
+            if st.button("📖 Generate Technical Encyclopedia", help="Create comprehensive technical PDF documentation"):
+                with st.spinner("Generating comprehensive technical documentation..."):
+                    try:
+                        import subprocess
+                        result = subprocess.run([
+                            sys.executable, "scripts/generate_technical_encyclopedia.py"
+                        ], capture_output=True, text=True, cwd=".")
+                        
+                        if result.returncode == 0:
+                            # Find the generated PDF path from output
+                            lines = result.stdout.split('\n')
+                            pdf_path = None
+                            for line in lines:
+                                if "Technical_Encyclopedia_" in line and line.endswith('.pdf'):
+                                    pdf_path = line.split(': ')[-1]
+                                    break
+                            
+                            if pdf_path and Path(pdf_path).exists():
+                                with open(pdf_path, "rb") as f:
+                                    pdf_bytes = f.read()
+                                st.download_button(
+                                    label="📥 Download Technical Encyclopedia PDF",
+                                    data=pdf_bytes,
+                                    file_name=Path(pdf_path).name,
+                                    mime="application/pdf",
+                                    use_container_width=True
+                                )
+                                st.success(f"📖 Technical Encyclopedia generated! ({len(pdf_bytes):,} bytes)")
+                            else:
+                                st.success("✅ Technical Encyclopedia generated! Check reports/ folder.")
+                        else:
+                            st.error(f"Generation failed: {result.stderr}")
+                    except Exception as e:
+                        st.error(f"Error generating encyclopedia: {e}")
 
         st.markdown("---")
         st.markdown("### 📊 Prediction & Clinical Decision Output")
