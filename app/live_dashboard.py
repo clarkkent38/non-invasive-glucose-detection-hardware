@@ -463,9 +463,10 @@ with tab_live:
             if st.button("📖 Generate Technical Encyclopedia", help="Create comprehensive technical PDF documentation"):
                 with st.spinner("Generating comprehensive technical documentation..."):
                     try:
+                        # First try the comprehensive version
                         import subprocess
                         result = subprocess.run([
-                            sys.executable, "scripts/generate_technical_encyclopedia.py"
+                            sys.executable, "scripts/generate_comprehensive_encyclopedia.py"
                         ], capture_output=True, text=True, cwd=".")
                         
                         if result.returncode == 0:
@@ -473,7 +474,7 @@ with tab_live:
                             lines = result.stdout.split('\n')
                             pdf_path = None
                             for line in lines:
-                                if "Technical_Encyclopedia_" in line and line.endswith('.pdf'):
+                                if "COMPREHENSIVE_Technical_Encyclopedia_" in line and line.endswith('.pdf'):
                                     pdf_path = line.split(': ')[-1]
                                     break
                             
@@ -481,17 +482,26 @@ with tab_live:
                                 with open(pdf_path, "rb") as f:
                                     pdf_bytes = f.read()
                                 st.download_button(
-                                    label="📥 Download Technical Encyclopedia PDF",
+                                    label="📥 Download COMPREHENSIVE Encyclopedia PDF",
                                     data=pdf_bytes,
                                     file_name=Path(pdf_path).name,
                                     mime="application/pdf",
                                     use_container_width=True
                                 )
-                                st.success(f"📖 Technical Encyclopedia generated! ({len(pdf_bytes):,} bytes)")
+                                st.success(f"📖 COMPREHENSIVE Technical Encyclopedia generated! ({len(pdf_bytes):,} bytes)")
                             else:
-                                st.success("✅ Technical Encyclopedia generated! Check reports/ folder.")
+                                st.success("✅ COMPREHENSIVE Encyclopedia generated! Check reports/ folder.")
                         else:
-                            st.error(f"Generation failed: {result.stderr}")
+                            # Fallback to original version
+                            st.warning("Comprehensive version failed, generating standard encyclopedia...")
+                            result_fallback = subprocess.run([
+                                sys.executable, "scripts/generate_technical_encyclopedia.py"
+                            ], capture_output=True, text=True, cwd=".")
+                            
+                            if result_fallback.returncode == 0:
+                                st.success("✅ Technical Encyclopedia generated! Check reports/ folder.")
+                            else:
+                                st.error(f"Generation failed: {result_fallback.stderr}")
                     except Exception as e:
                         st.error(f"Error generating encyclopedia: {e}")
 
