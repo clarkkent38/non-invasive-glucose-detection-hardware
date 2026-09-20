@@ -213,6 +213,10 @@ void onStatus() {
   server.send(200,"application/json",r);
 }
 
+// ── Forward declarations (needed because onStart() calls printPHReady()) ──────
+void printHome();
+void printPHReady();
+
 // ── Screen print functions (Serial Monitor) ───────────────────────────────────
 void printHome() {
   div('=');
@@ -318,9 +322,6 @@ void printResults(const char* name, float bgl, float ciLo, float ciHi,
   div('=');
   Serial.println("  Demo complete. Restarting in 30 seconds...");
 }
-
-// forward declaration needed because onStart() calls printPHReady()
-void printPHReady();
 
 // =============================================================================
 // ── SETUP ────────────────────────────────────────────────────────────────────
