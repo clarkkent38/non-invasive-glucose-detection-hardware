@@ -29,14 +29,18 @@
  * ============================================================================
  */
 
-// ── User configuration — FILL THESE IN ──────────────────────────────────────
-#define WIFI_SSID          "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD      "YOUR_WIFI_PASSWORD"
-#define SUPABASE_PROJECT   "YOUR_PROJECT_REF"   // e.g. "abcdefghijklmnop"
-#define SUPABASE_ANON_KEY  "YOUR_ANON_KEY"      // starts with "eyJ..."
-#define DEVICE_ID          "esp32_node_01"      // unique per physical device
-// Supabase REST endpoint:
-// https://<SUPABASE_PROJECT>.supabase.co/rest/v1/readings
+// ── User configuration ──────────────────────────────────────────────────────
+// WiFi: fill in your own network credentials (never commit passwords to git)
+#define WIFI_SSID          "YOUR_WIFI_SSID"      // ← replace with your SSID
+#define WIFI_PASSWORD      "YOUR_WIFI_PASSWORD"  // ← replace with your password
+
+// Supabase — project ref is the subdomain of your Supabase URL
+// URL: https://mjcwhnkyojfaezydvpsp.supabase.co  → ref = mjcwhnkyojfaezydvpsp
+#define SUPABASE_PROJECT   "mjcwhnkyojfaezydvpsp"
+#define SUPABASE_ANON_KEY  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1qY3dobmt5b2pmYWV6eWR2cHNwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk4NzA5MTYsImV4cCI6MjEwNTQ0NjkxNn0.G1nM1QYYztA2DStOOQ2qOD2Y7RP2n4KnaQKYe1WeVFM"
+#define DEVICE_ID          "esp32_node_01"       // change per physical device
+// Supabase REST endpoint (assembled in postToSupabase()):
+// https://mjcwhnkyojfaezydvpsp.supabase.co/rest/v1/readings
 
 // ── pH probe calibration — calibrate with pH 4 / 7 / 10 buffer solutions ────
 // Measure raw ADC (0–4095 on 12-bit) at two known pH points, then solve:

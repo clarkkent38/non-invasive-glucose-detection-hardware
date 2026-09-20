@@ -9,6 +9,8 @@ Streamlit dashboard via Supabase.
 
 - A **Supabase account** — free tier is sufficient (500 MB, 2 projects):
   https://supabase.com/dashboard
+  **Project already created:** https://mjcwhnkyojfaezydvpsp.supabase.co
+- **Hardware GitHub repo:** https://github.com/clarkkent38/non-invasive-glucose-detection-hardware
 - **Arduino IDE 2.x** with the ESP32-S3 board package installed
 - The three sensors wired to the ESP32-S3 (see Section 4)
 - Python 3.9+ with the project's `requirements.txt` installed
@@ -33,29 +35,36 @@ Streamlit dashboard via Supabase.
 
 ---
 
-## Step 2 — Find Your Supabase URL and Anon Key
+## Step 2 — Your Supabase Credentials (already set up)
 
-1. In the Supabase dashboard, click **Project Settings** (gear icon, bottom-left).
-2. Click **API** in the settings sidebar.
-3. Note down two values:
-   - **Project URL** — looks like `https://abcdefghijklmnop.supabase.co`
-   - **anon / public** key — a long JWT string starting with `eyJ`
+Your Supabase project is live. The values below are already wired into all
+project files:
 
-You will use these in Steps 3 and 5.
+| Value | What it is |
+|---|---|
+| **Project URL** | `https://mjcwhnkyojfaezydvpsp.supabase.co` |
+| **Project ref** | `mjcwhnkyojfaezydvpsp` (the subdomain) |
+| **Anon / public key** | `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…` (in firmware + secrets.toml) |
+
+> ⚠️ **Keep your secret key (`sb_secret_...`) out of all files and repos.**
+> It should only be used in the Supabase dashboard or trusted server environments.
+> The anon key above is safe for device firmware and client-side code.
 
 ---
 
 ## Step 3 — Configure the ESP32 Firmware
 
 1. Open `firmware/esp32_sensor_node.ino` in Arduino IDE.
-2. At the top of the file, fill in your values in the `#define` section:
+2. The Supabase credentials are already filled in. You only need to set your
+   WiFi password:
 
 ```cpp
-#define WIFI_SSID         "YourNetworkName"
-#define WIFI_PASSWORD     "YourNetworkPassword"
-#define SUPABASE_PROJECT  "abcdefghijklmnop"   // just the ref, not full URL
-#define SUPABASE_ANON_KEY "eyJ..."             // full anon key
-#define DEVICE_ID         "esp32_node_01"      // any unique label
+#define WIFI_SSID         "YourNetworkName"    // ← your WiFi network name
+#define WIFI_PASSWORD     "YourWiFiPassword"   // ← your WiFi password
+// These are already set:
+#define SUPABASE_PROJECT  "mjcwhnkyojfaezydvpsp"
+#define SUPABASE_ANON_KEY "eyJhbGciOiJIUzI1NiIs..."
+#define DEVICE_ID         "esp32_node_01"
 ```
 
 3. Install the required libraries via **Tools → Manage Libraries**:
@@ -157,25 +166,15 @@ Serial output on success:
 
 ## Step 5 — Configure Streamlit Locally
 
-1. Copy the example secrets file:
-   ```
-   cp .streamlit/secrets.toml.example .streamlit/secrets.toml
-   ```
-   (`secrets.toml` is in `.gitignore` — it will never be committed.)
+1. The secrets file already exists at `.streamlit/secrets.toml` with your
+   Supabase credentials filled in (it's gitignored and won't be committed).
 
-2. Edit `.streamlit/secrets.toml`:
-   ```toml
-   [supabase]
-   url = "https://abcdefghijklmnop.supabase.co"
-   key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-   ```
-
-3. Run the live dashboard:
+2. Run the live dashboard:
    ```
    streamlit run app/live_dashboard.py
    ```
 
-4. Select **🔴 Live Sensor Mode** at the top. Press **Fetch Latest Reading**.
+3. Select **🔴 Live Sensor Mode** at the top. Press **Fetch Latest Reading**.
    The reading taken in Step 4 should appear.
 
 ---
@@ -191,8 +190,8 @@ You deploy `app/live_dashboard.py` as a **separate app** from the same repo.
 4. Click **Advanced settings → Secrets** and paste:
    ```toml
    [supabase]
-   url = "https://abcdefghijklmnop.supabase.co"
-   key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+   url = "https://mjcwhnkyojfaezydvpsp.supabase.co"
+   key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1qY3dobmt5b2pmYWV6eWR2cHNwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk4NzA5MTYsImV4cCI6MjEwNTQ0NjkxNn0.G1nM1QYYztA2DStOOQ2qOD2Y7RP2n4KnaQKYe1WeVFM"
    ```
 5. Click **Deploy**.
 
