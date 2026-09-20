@@ -3,86 +3,64 @@
  * Non-Invasive Glucose Prediction System — ESP32-S3 Interactive Sensor Node
  * ============================================================================
  *
- * Hardware:
- *   MAX30102   — Optical PPG (IR + RED), heart rate, perfusion index
- *                I2C address: 0x57  SDA=GPIO8  SCL=GPIO9
- *   TMP117     — High-precision skin-contact temperature
- *                I2C address: 0x48  Same SDA/SCL bus
- *   pH Probe   — Analog saliva pH via signal conditioner → GPIO4 (ADC)
- *   ST7789 TFT — 240x240 IPS display with beautiful sensor UI
- *   Tactile    — Manual reading trigger button → GPIO0 (internal pull-up)
+ * COMPLETE STEP-BY-STEP FLOW:
+ *   1. Press tactile button (or dashboard triggers remotely)
+ *   2. ST7789 shows step-by-step sensor collection progress
+ *   3. Sensors collected → row inserted to Supabase with status='pending'
+ *   4. Display shows "Open dashboard — enter your details"
+ *   5. User opens Streamlit dashboard, fills in name/age/etc, clicks Submit
+ *   6. Dashboard runs prediction, patches row to status='complete'
+ *   7. ESP32 polls Supabase every 5s for status='complete' on its row
+ *   8. When complete: display shows patient name, glucose, Clarke zone, category
+ *   9. Returns to home screen after 30s, ready for next reading
  *
- * Wiring:
- *   ┌─ I2C Bus ────────────────┬─ SPI Display ──────────┬─ Analog/Digital ─┐
- *   │ MAX30102  3.3V/GND       │ ST7789   VCC → 3.3V    │ pH probe → GPIO4 │
- *   │           SDA → GPIO8    │          GND → GND     │ Button   → GPIO0 │
- *   │           SCL → GPIO9    │          SCL → GPIO18  │                  │
- *   │ TMP117    3.3V/GND       │          SDA → GPIO23  │                  │
- *   │           SDA → GPIO8    │          RES → GPIO2   │                  │
- *   │           SCL → GPIO9    │          DC  → GPIO15  │                  │
- *   └──────────────────────────┤          BLK → GPIO21  │                  │
+ * WIRING:
+ *   ┌─ I2C ────────────────────┬─ SPI Display ──────────┬─ Analog/Digital ─┐
+ *   │ MAX30102  SDA → GPIO8    │ ST7789  VCC → 3.3V     │ pH probe → GPIO4 │
+ *   │           SCL → GPIO9    │         GND → GND      │ Button   → GPIO0 │
+ *   │ TMP117    SDA → GPIO8    │         SCL → GPIO18   │                  │
+ *   │           SCL → GPIO9    │         SDA → GPIO23   │                  │
+ *   └──────────────────────────┤         RES → GPIO2    │                  │
+ *                              │         DC  → GPIO15   │                  │
+ *                              │         BLK → GPIO21   │                  │
  *                              └────────────────────────┴──────────────────┘
  *
- * Features:
- *   • Step-by-step sensor collection with real-time progress display
- *   • Beautiful bordered UI showing all sensor readings and glucose prediction
- *   • Manual readings: Press tactile button to start collection sequence
- *   • Remote readings: Dashboard can trigger via HTTP POST /start_reading
- *   • Automatic cloud upload after successful collection
- *   • Professional device interface with status indicators
- *
- * Required Arduino Libraries (Library Manager):
- *   - Adafruit ST7789 (for display)
- *   - Adafruit GFX Library (display graphics)
- *   - SparkFun MAX3010x Pulse and Proximity Sensor Library
- *   - SparkFun TMP117 High Accuracy I2C Temperature Sensor
- *   - ArduinoJson >= 6.x
- *   - WiFi, HTTPClient, WebServer (built-in ESP32 core)
- *
- * Board: ESP32S3 Dev Module
+ * REQUIRED LIBRARIES (Arduino Library Manager):
+ *   Adafruit ST7789 · Adafruit GFX · SparkFun MAX3010x · SparkFun TMP117
+ *   ArduinoJson >= 6.x  (WiFi / HTTPClient / WebServer built into ESP32 core)
  * ============================================================================
  */
-// ── User Configuration ──────────────────────────────────────────────────────
-// WiFi: fill in your own network credentials (never commit passwords to git)
-#define WIFI_SSID          "YOUR_WIFI_SSID"      // ← replace with your SSID
-#define WIFI_PASSWORD      "YOUR_WIFI_PASSWORD"  // ← replace with your password
 
-// Supabase — project ref is the subdomain of your Supabase URL
-// URL: https://mjcwhnkyojfaezydvpsp.supabase.co  → ref = mjcwhnkyojfaezydvpsp
-#define SUPABASE_PROJECT   "mjcwhnkyojfaezydvpsp"
-#define SUPABASE_ANON_KEY  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1qY3dobmt5b2pmYWV6eWR2cHNwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk4NzA5MTYsImV4cCI6MjEwNTQ0NjkxNn0.G1nM1QYYztA2DStOOQ2qOD2Y7RP2n4KnaQKYe1WeVFM"
-#define DEVICE_ID          "esp32_node_01"       // change per physical device
+// ── User Configuration ───────────────────────────────────────────────────────
+#define WIFI_SSID         "YOUR_WIFI_SSID"      // ← your network name
+#define WIFI_PASSWORD     "YOUR_WIFI_PASSWORD"  // ← your password
 
-// ── Hardware Pin Configuration ──────────────────────────────────────────────
-// I2C pins for MAX30102 + TMP117
-#define I2C_SDA            8
-#define I2C_SCL            9
+#define SUPABASE_PROJECT  "mjcwhnkyojfaezydvpsp"
+#define SUPABASE_ANON_KEY "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1qY3dobmt5b2pmYWV6eWR2cHNwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk4NzA5MTYsImV4cCI6MjEwNTQ0NjkxNn0.G1nM1QYYztA2DStOOQ2qOD2Y7RP2n4KnaQKYe1WeVFM"
+#define DEVICE_ID         "esp32_node_01"
 
-// SPI pins for ST7789 TFT display
-#define TFT_SCL            18    // SPI clock 
-#define TFT_SDA            23    // SPI MOSI (data)
-#define TFT_RES            2     // Reset
-#define TFT_DC             15    // Data/Command
-#define TFT_BLK            21    // Backlight control
-// No CS pin needed for this ST7789 variant
-
-// Analog and digital inputs
-#define PH_ADC_PIN         4     // Analog pH probe input
-#define BUTTON_PIN         0     // Tactile button (GPIO0 = BOOT button)
+// ── Pin Configuration ────────────────────────────────────────────────────────
+#define I2C_SDA   8
+#define I2C_SCL   9
+#define TFT_SCL   18
+#define TFT_SDA   23
+#define TFT_RES   2
+#define TFT_DC    15
+#define TFT_BLK   21
+#define PH_ADC_PIN 4
+#define BUTTON_PIN 0
 
 // ── Sensor Parameters ────────────────────────────────────────────────────────
-// pH probe calibration (replace with your measured values)
-#define PH_SLOPE          -0.0017f    // pH units per ADC count
-#define PH_INTERCEPT      14.0f       // offset term
+#define PH_SLOPE           -0.0017f
+#define PH_INTERCEPT        14.0f
+#define PPG_SAMPLE_MS       5000
+#define PPG_RATE_HZ         100
+#define PPG_SAMPLES_NEEDED  (PPG_RATE_HZ * PPG_SAMPLE_MS / 1000)   // 500
+#define POLL_INTERVAL_MS    5000    // how often to check Supabase for 'complete'
+#define POLL_TIMEOUT_MS     300000  // 5 minutes max wait for user details
+#define WEB_SERVER_PORT     80
 
-// PPG sampling parameters
-#define PPG_SAMPLE_WINDOW_MS  5000    // 5 seconds of PPG data per reading
-#define PPG_SAMPLE_RATE_HZ    100     // MAX30102 sample rate
-#define PPG_SAMPLES_NEEDED    (PPG_SAMPLE_RATE_HZ * PPG_SAMPLE_WINDOW_MS / 1000)
-
-// Web server port for dashboard-initiated readings
-#define WEB_SERVER_PORT   80
-// ── Library Includes ────────────────────────────────────────────────────────
+// ── Libraries ────────────────────────────────────────────────────────────────
 #include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -95,682 +73,695 @@
 #include "heartRate.h"
 #include <SparkFunTMP117.h>
 
-// ── Hardware Objects ────────────────────────────────────────────────────────
-MAX30105 ppgSensor;
-TMP117   tmpSensor;
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_DC, TFT_RES, TFT_SDA, TFT_SCL);
-WebServer server(WEB_SERVER_PORT);
+// ── Hardware Objects ─────────────────────────────────────────────────────────
+MAX30105          ppgSensor;
+TMP117            tmpSensor;
+Adafruit_ST7789   tft = Adafruit_ST7789(TFT_DC, TFT_RES, TFT_SDA, TFT_SCL);
+WebServer         server(WEB_SERVER_PORT);
 
-// ── Global State ────────────────────────────────────────────────────────────
+// ── Display Colour Palette ───────────────────────────────────────────────────
+#define C_BG       0x0000   // black
+#define C_WHITE    0xFFFF
+#define C_CYAN     0x07FF
+#define C_YELLOW   0xFFE0
+#define C_GREEN    0x07E0
+#define C_RED      0xF800
+#define C_ORANGE   0xFD20
+#define C_BLUE     0x001F
+#define C_LBLUE    0x867F   // light blue / progress bar
+#define C_GREY     0x7BEF
+#define C_DGREY    0x39E7   // dark grey border
+
+// ── Sensor Data ──────────────────────────────────────────────────────────────
 struct SensorData {
-  float saliva_ph;
-  float hr_bpm;
-  float ppg_raw_dc_baseline;
-  float ppg_raw_ac_p2p;
-  float temperature_c;
-  float perfusion_index;
-  float pulse_width_ms;
-  bool valid;
+  float saliva_ph          = 0;
+  float hr_bpm             = 0;
+  float ppg_raw_dc_baseline= 0;
+  float ppg_raw_ac_p2p     = 0;
+  float temperature_c      = 0;
+  float perfusion_index    = 0;
+  float pulse_width_ms     = 0;
+  bool  valid              = false;
 };
 
-SensorData latestReading;
-bool readingInProgress = false;
-bool buttonPressed = false;
-unsigned long lastButtonCheck = 0;
-const unsigned long buttonDebounceMs = 200;
+// ── Global State ─────────────────────────────────────────────────────────────
+SensorData  latest;
+bool        readingInProgress = false;
+bool        triggerReading    = false;
+long        currentRowId      = -1;   // Supabase row id of the current reading
+unsigned long lastButtonTime  = 0;
 
-// ── Display Colors ──────────────────────────────────────────────────────────
-#define COLOR_BG          ST77XX_BLACK
-#define COLOR_BORDER      ST77XX_WHITE
-#define COLOR_TITLE       ST77XX_CYAN
-#define COLOR_LABEL       ST77XX_YELLOW
-#define COLOR_VALUE       ST77XX_GREEN
-#define COLOR_ERROR       ST77XX_RED
-#define COLOR_PROGRESS    ST77XX_BLUE
-#define COLOR_SUCCESS     ST77XX_GREEN
-// ── Display Functions ───────────────────────────────────────────────────────
-void initDisplay() {
-  pinMode(TFT_BLK, OUTPUT);
-  digitalWrite(TFT_BLK, HIGH);  // Turn on backlight
-  
-  tft.init(240, 240);           // Initialize 240x240 display
-  tft.setRotation(0);           // Portrait mode
-  tft.fillScreen(COLOR_BG);
-  
-  drawWelcomeScreen();
-}
+// =============================================================================
+// ── DISPLAY HELPERS ──────────────────────────────────────────────────────────
+// =============================================================================
 
-void drawBorder() {
-  // Draw outer border
-  tft.drawRect(0, 0, 240, 240, COLOR_BORDER);
-  tft.drawRect(1, 1, 238, 238, COLOR_BORDER);
-}
+void tftClear() { tft.fillScreen(C_BG); }
 
-void drawWelcomeScreen() {
-  tft.fillScreen(COLOR_BG);
-  drawBorder();
-  
-  // Title
-  tft.setTextColor(COLOR_TITLE);
+// Outer double-border with title bar
+void drawChrome(const char* title, uint16_t titleBg, uint16_t titleFg) {
+  // outer border
+  tft.drawRect(0, 0, 240, 240, C_WHITE);
+  tft.drawRect(1, 1, 238, 238, C_DGREY);
+  // title bar
+  tft.fillRect(2, 2, 236, 28, titleBg);
+  tft.drawRect(2, 2, 236, 28, C_WHITE);
+  tft.setTextColor(titleFg);
   tft.setTextSize(2);
-  tft.setCursor(35, 20);
-  tft.print("Glucose Monitor");
-  
-  // Device ID
-  tft.setTextColor(COLOR_LABEL);
+  int tw = strlen(title) * 12;
+  tft.setCursor((240 - tw) / 2, 9);
+  tft.print(title);
+}
+
+// Horizontal divider line
+void hLine(int y) { tft.drawFastHLine(4, y, 232, C_DGREY); }
+
+// Key-value row
+void kv(int y, const char* key, const char* val, uint16_t valColor = C_GREEN) {
   tft.setTextSize(1);
-  tft.setCursor(10, 50);
-  tft.print("Device: ");
-  tft.setTextColor(COLOR_VALUE);
-  tft.print(DEVICE_ID);
-  
-  // WiFi status
-  tft.setTextColor(COLOR_LABEL);
-  tft.setCursor(10, 70);
-  tft.print("WiFi: ");
+  tft.setTextColor(C_GREY);
+  tft.setCursor(10, y);
+  tft.print(key);
+  tft.setTextColor(valColor);
+  tft.setCursor(130, y);
+  tft.print(val);
+}
+
+// Progress bar (x,y,w,h, 0-100 percent, colour)
+void progressBar(int x, int y, int w, int h, int pct, uint16_t col) {
+  tft.drawRect(x, y, w, h, C_GREY);
+  int fill = (w - 2) * pct / 100;
+  if (fill > 0) tft.fillRect(x + 1, y + 1, fill, h - 2, col);
+}
+
+// =============================================================================
+// ── SCREENS ──────────────────────────────────────────────────────────────────
+// =============================================================================
+
+void screenHome() {
+  tftClear();
+  drawChrome("  Glucose Monitor", 0x000F /*dark navy*/, C_CYAN);
+
+  tft.setTextColor(C_WHITE); tft.setTextSize(1);
+  tft.setCursor(10, 42);  tft.print("Device : "); tft.setTextColor(C_CYAN);  tft.print(DEVICE_ID);
+  tft.setTextColor(C_WHITE); tft.setCursor(10, 56);  tft.print("Network: ");
   if (WiFi.status() == WL_CONNECTED) {
-    tft.setTextColor(COLOR_SUCCESS);
-    tft.print("Connected");
-    tft.setTextColor(COLOR_VALUE);
-    tft.setCursor(10, 85);
-    tft.print(WiFi.localIP());
+    tft.setTextColor(C_GREEN); tft.print("Connected");
+    tft.setTextColor(C_GREY);  tft.setCursor(10, 70); tft.print(WiFi.localIP().toString().c_str());
   } else {
-    tft.setTextColor(COLOR_ERROR);
-    tft.print("Disconnected");
+    tft.setTextColor(C_RED); tft.print("No WiFi");
   }
-  
-  // Instructions
-  tft.setTextColor(COLOR_TITLE);
-  tft.setTextSize(1);
-  tft.setCursor(10, 120);
-  tft.print("Press button or use dashboard");
-  tft.setCursor(10, 135);
-  tft.print("to start sensor reading");
-  
-  // Status box
-  tft.drawRect(10, 160, 220, 60, COLOR_BORDER);
-  tft.setTextColor(COLOR_LABEL);
-  tft.setCursor(15, 170);
-  tft.print("Status: Ready");
-  tft.setCursor(15, 185);
-  tft.print("Last reading: None");
-  tft.setCursor(15, 200);
-  tft.print("Waiting for trigger...");
-}
-void drawSensorProgress(const char* sensorName, int stepNum, int totalSteps, bool success = false) {
-  tft.fillScreen(COLOR_BG);
-  drawBorder();
-  
-  // Title
-  tft.setTextColor(COLOR_TITLE);
-  tft.setTextSize(2);
-  tft.setCursor(20, 20);
-  tft.print("Reading Sensors");
-  
-  // Progress indicator
-  tft.setTextColor(COLOR_LABEL);
-  tft.setTextSize(1);
-  tft.setCursor(10, 50);
-  tft.print("Step ");
-  tft.setTextColor(COLOR_VALUE);
-  tft.print(stepNum);
-  tft.setTextColor(COLOR_LABEL);
-  tft.print(" of ");
-  tft.setTextColor(COLOR_VALUE);
-  tft.print(totalSteps);
-  
-  // Progress bar
-  int barWidth = 200;
-  int barHeight = 10;
-  int barX = 20;
-  int barY = 70;
-  
-  tft.drawRect(barX, barY, barWidth, barHeight, COLOR_BORDER);
-  int fillWidth = (barWidth * stepNum) / totalSteps;
-  tft.fillRect(barX + 1, barY + 1, fillWidth - 1, barHeight - 2, COLOR_PROGRESS);
-  
-  // Current sensor
-  tft.setTextColor(COLOR_TITLE);
-  tft.setTextSize(1);
-  tft.setCursor(10, 100);
-  tft.print("Current: ");
-  tft.setTextColor(success ? COLOR_SUCCESS : COLOR_VALUE);
-  tft.print(sensorName);
-  
-  if (success) {
-    tft.setTextColor(COLOR_SUCCESS);
-    tft.setCursor(170, 100);
-    tft.print("✓ Done");
-  } else {
-    // Animate dots
-    tft.setTextColor(COLOR_LABEL);
-    tft.setCursor(10, 120);
-    static int dotCount = 0;
-    dotCount = (dotCount + 1) % 4;
-    tft.print("Reading");
-    for (int i = 0; i < dotCount; i++) {
-      tft.print(".");
-    }
-    for (int i = dotCount; i < 3; i++) {
-      tft.print(" ");
-    }
-  }
+
+  hLine(82);
+
+  // Big "Press button" prompt
+  tft.setTextColor(C_YELLOW); tft.setTextSize(2);
+  tft.setCursor(18, 98);  tft.print("Press Button");
+  tft.setCursor(28, 118); tft.print("to Start Test");
+
+  hLine(140);
+
+  tft.setTextSize(1); tft.setTextColor(C_GREY);
+  tft.setCursor(10, 150); tft.print("Or trigger from dashboard:");
+  tft.setTextColor(C_CYAN);
+  // Show IP for dashboard remote trigger
+  String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "---";
+  tft.setCursor(10, 163); tft.printf("http://%s/start_reading", ip.c_str());
+
+  hLine(178);
+
+  tft.setTextColor(C_GREY); tft.setTextSize(1);
+  tft.setCursor(10, 186); tft.print("Status: Ready");
+  tft.setCursor(10, 200); tft.print("Last row ID: ");
+  tft.setTextColor(C_CYAN);
+  if (currentRowId > 0) tft.print(currentRowId);
+  else tft.print("None");
 }
 
-void drawSensorResults(const SensorData& data) {
-  tft.fillScreen(COLOR_BG);
-  drawBorder();
-  
-  // Title
-  tft.setTextColor(COLOR_TITLE);
-  tft.setTextSize(2);
-  tft.setCursor(45, 15);
-  tft.print("Sensor Data");
-  
-  int y = 45;
-  int lineHeight = 18;
-  
-  // Helper function to draw sensor value
-  auto drawValue = [&](const char* label, float value, const char* unit) {
-    tft.setTextColor(COLOR_LABEL);
-    tft.setTextSize(1);
-    tft.setCursor(10, y);
-    tft.print(label);
-    tft.setCursor(10, y + 10);
-    tft.setTextColor(COLOR_VALUE);
-    tft.print(value, 2);
-    tft.print(" ");
-    tft.print(unit);
-    y += lineHeight;
-  };
-  
-  drawValue("pH Level:", data.saliva_ph, "pH");
-  drawValue("Heart Rate:", data.hr_bpm, "bpm");
-  drawValue("Temperature:", data.temperature_c, "°C");
-  drawValue("Perfusion:", data.perfusion_index, "%");
-  drawValue("PPG DC:", data.ppg_raw_dc_baseline, "");
-  drawValue("PPG AC:", data.ppg_raw_ac_p2p, "");
-  drawValue("Pulse Width:", data.pulse_width_ms, "ms");
-  
-  // Upload status
-  tft.drawRect(10, 180, 220, 50, COLOR_BORDER);
-  tft.setTextColor(COLOR_TITLE);
-  tft.setCursor(15, 190);
-  tft.print("Cloud Upload: ");
-  tft.setTextColor(COLOR_SUCCESS);
-  tft.print("Complete");
-  
-  tft.setTextColor(COLOR_LABEL);
-  tft.setCursor(15, 205);
-  tft.print("Ready for next reading");
-  tft.setCursor(15, 220);
-  tft.print("Press button to repeat");
+void screenStep(const char* sensor, int step, int total, bool done = false) {
+  if (step == 1) {
+    tftClear();
+    drawChrome("Collecting Sensors", 0x0010 /*dark blue*/, C_CYAN);
+  }
+
+  // Progress bar at top
+  int pct = done ? (step * 100 / total) : ((step - 1) * 100 / total);
+  tft.fillRect(4, 32, 232, 10, C_BG);
+  progressBar(4, 32, 232, 10, pct, C_LBLUE);
+
+  // Step counter
+  tft.fillRect(4, 44, 232, 12, C_BG);
+  tft.setTextColor(C_GREY); tft.setTextSize(1);
+  tft.setCursor(10, 46);
+  tft.printf("Step %d of %d", step, total);
+
+  // Current sensor row (offset by step so they stack)
+  int rowY = 62 + (step - 1) * 20;
+  tft.fillRect(4, rowY - 2, 232, 18, C_BG);
+  if (done) {
+    tft.setTextColor(C_GREEN);
+    tft.setCursor(10, rowY); tft.print("[OK] ");
+  } else {
+    tft.setTextColor(C_YELLOW);
+    tft.setCursor(10, rowY); tft.print("[..] ");
+  }
+  tft.setTextColor(C_WHITE); tft.print(sensor);
 }
-// ── Sensor Functions ────────────────────────────────────────────────────────
+
+void screenWaitingUser(long rowId) {
+  tftClear();
+  drawChrome(" Awaiting Details", 0x3000 /*dark amber*/, C_YELLOW);
+
+  hLine(34);
+
+  tft.setTextColor(C_WHITE); tft.setTextSize(1);
+  tft.setCursor(10, 42); tft.print("Sensors: ");
+  tft.setTextColor(C_GREEN); tft.print("Collected & uploaded");
+
+  tft.setTextColor(C_GREY); tft.setCursor(10, 56); tft.printf("Row ID: %ld", rowId);
+
+  hLine(68);
+
+  // Big instruction
+  tft.setTextColor(C_YELLOW); tft.setTextSize(2);
+  tft.setCursor(14, 80); tft.print("Open Dashboard");
+
+  tft.setTextColor(C_WHITE); tft.setTextSize(1);
+  tft.setCursor(10, 104); tft.print("Enter your details:");
+  tft.setTextColor(C_CYAN); tft.setTextSize(1);
+  tft.setCursor(14, 118); tft.print(" Name, Age, BMI, Diagnosis");
+  tft.setCursor(14, 132); tft.print(" Fasting state, Medications");
+
+  tft.setTextColor(C_WHITE); tft.setCursor(10, 148); tft.print("Then press");
+  tft.setTextColor(C_GREEN);  tft.print("  Submit");
+
+  hLine(162);
+
+  // Spinner / waiting indicator
+  tft.setTextColor(C_GREY); tft.setTextSize(1);
+  tft.setCursor(10, 170); tft.print("Waiting for prediction...");
+
+  // WiFi IP for easy access
+  if (WiFi.status() == WL_CONNECTED) {
+    tft.setTextColor(C_DGREY);
+    tft.setCursor(10, 186);
+    tft.printf("IP: %s", WiFi.localIP().toString().c_str());
+  }
+
+  tft.setTextColor(C_GREY);
+  tft.setCursor(10, 200); tft.print("Polling Supabase every 5s");
+}
+
+void screenPolling(long rowId, int secondsElapsed) {
+  // Only update the dynamic parts (avoid full redraw flicker)
+  // Refresh the "seconds waiting" and pulse dots
+  tft.fillRect(4, 194, 232, 18, C_BG);
+  tft.setTextColor(C_GREY); tft.setTextSize(1);
+  tft.setCursor(10, 196);
+  tft.printf("Waiting %ds... (max 300s)", secondsElapsed);
+
+  // Animated dot indicator
+  static int dot = 0;
+  dot = (dot + 1) % 4;
+  tft.fillRect(4, 210, 232, 14, C_BG);
+  tft.setTextColor(C_LBLUE); tft.setCursor(10, 212);
+  for (int i = 0; i < 4; i++) tft.print(i < dot ? ">" : " ");
+}
+
+void screenError(const char* line1, const char* line2 = "") {
+  tftClear();
+  drawChrome("   !! ERROR !!", C_RED, C_WHITE);
+
+  tft.setTextColor(C_RED); tft.setTextSize(2);
+  tft.setCursor(20, 80);  tft.print("Reading");
+  tft.setCursor(20, 100); tft.print("Failed");
+
+  tft.setTextColor(C_WHITE); tft.setTextSize(1);
+  tft.setCursor(10, 140); tft.print(line1);
+  if (strlen(line2) > 0) { tft.setCursor(10, 156); tft.print(line2); }
+
+  tft.setTextColor(C_GREY);
+  tft.setCursor(10, 188); tft.print("Press button to retry");
+  delay(3000);
+}
+
+// Final results screen — shown after prediction comes back
+void screenResults(const char* patientName,
+                   float bgl, float ciLow, float ciHigh,
+                   const char* zone, const char* category,
+                   bool isOod) {
+  tftClear();
+  drawChrome("   Results", 0x0410 /*dark green*/, C_GREEN);
+
+  // Patient name
+  hLine(34);
+  tft.setTextColor(C_YELLOW); tft.setTextSize(1);
+  tft.setCursor(10, 38); tft.print("Patient: ");
+  tft.setTextColor(C_WHITE); tft.setTextSize(1);
+  tft.print(patientName[0] ? patientName : "—");
+  hLine(50);
+
+  // Big glucose reading
+  uint16_t bglColor = C_GREEN;
+  if (bgl < 70 || bgl >= 180) bglColor = C_RED;
+  else if (bgl >= 126)         bglColor = C_ORANGE;
+  else if (bgl >= 100)         bglColor = C_YELLOW;
+
+  tft.setTextColor(C_GREY); tft.setTextSize(1);
+  tft.setCursor(10, 58); tft.print("Blood Glucose (predicted):");
+
+  tft.setTextColor(bglColor); tft.setTextSize(3);
+  char bglStr[16];
+  snprintf(bglStr, sizeof(bglStr), "%.1f", bgl);
+  int bglW = strlen(bglStr) * 18;
+  tft.setCursor((240 - bglW - 36) / 2, 72);
+  tft.print(bglStr);
+  tft.setTextColor(C_GREY); tft.setTextSize(1);
+  tft.print(" mg/dL");
+
+  // Confidence interval
+  tft.setTextColor(C_GREY); tft.setTextSize(1);
+  tft.setCursor(10, 106);
+  tft.printf("90%% CI: %.1f – %.1f mg/dL", ciLow, ciHigh);
+
+  hLine(118);
+
+  // Clarke zone badge
+  uint16_t zoneCol = C_GREEN;
+  if (zone[5] == 'B') zoneCol = C_YELLOW;
+  else if (zone[5] == 'C' || zone[5] == 'D' || zone[5] == 'E') zoneCol = C_ORANGE;
+
+  tft.setTextColor(C_GREY); tft.setTextSize(1);
+  tft.setCursor(10, 126); tft.print("Clarke Zone:");
+  tft.setTextColor(zoneCol); tft.setTextSize(2);
+  tft.setCursor(110, 122); tft.print(zone);
+
+  hLine(146);
+
+  // Category
+  tft.setTextColor(C_GREY); tft.setTextSize(1);
+  tft.setCursor(10, 152); tft.print("Category:");
+  tft.setTextColor(bglColor); tft.setCursor(80, 152); tft.print(category);
+
+  // OOD warning
+  if (isOod) {
+    tft.setTextColor(C_ORANGE);
+    tft.setCursor(10, 166); tft.print("! Input outside training range");
+  }
+
+  hLine(178);
+
+  tft.setTextColor(C_GREY); tft.setTextSize(1);
+  tft.setCursor(10, 184); tft.print("Screen clears in 30s");
+  tft.setCursor(10, 198); tft.print("Row ID: "); tft.setTextColor(C_CYAN); tft.print(currentRowId);
+
+  // Research disclaimer
+  tft.setTextColor(0x4A49);  // very dim grey
+  tft.setCursor(10, 214); tft.print("Research only. Not clinical.");
+}
+
+// =============================================================================
+// ── SENSOR READING ───────────────────────────────────────────────────────────
+// =============================================================================
+
 bool initSensors() {
-  // Initialize I2C
   Wire.begin(I2C_SDA, I2C_SCL);
-  
-  // Initialize MAX30102
-  if (!ppgSensor.begin()) {
-    Serial.println("ERROR: MAX30102 not found");
-    return false;
-  }
-  
+  if (!ppgSensor.begin()) { Serial.println("ERR: MAX30102 not found"); return false; }
   ppgSensor.setup();
-  ppgSensor.setPulseAmplitudeRed(0x0A);    // Turn Red LED to low
-  ppgSensor.setPulseAmplitudeIR(0x1F);     // Turn IR LED to medium
-  
-  // Initialize TMP117
-  if (!tmpSensor.begin()) {
-    Serial.println("ERROR: TMP117 not found");
-    return false;
-  }
-  
-  Serial.println("All sensors initialized successfully");
+  ppgSensor.setPulseAmplitudeRed(0x0A);
+  ppgSensor.setPulseAmplitudeIR(0x1F);
+  if (!tmpSensor.begin()) { Serial.println("ERR: TMP117 not found"); return false; }
+  Serial.println("Sensors OK");
   return true;
 }
 
-float readpH() {
-  int rawADC = analogRead(PH_ADC_PIN);
-  float voltage = rawADC * (3.3 / 4095.0);  // Convert to voltage
-  float ph = PH_SLOPE * rawADC + PH_INTERCEPT;
-  
-  Serial.print("pH - Raw ADC: ");
-  Serial.print(rawADC);
-  Serial.print(", Voltage: ");
-  Serial.print(voltage, 3);
-  Serial.print("V, pH: ");
-  Serial.println(ph, 2);
-  
-  return ph;
+float readPH() {
+  long sum = 0;
+  for (int i = 0; i < 16; i++) { sum += analogRead(PH_ADC_PIN); delay(5); }
+  int raw = sum / 16;
+  return PH_SLOPE * raw + PH_INTERCEPT;
 }
 
-float readTemperature() {
-  if (tmpSensor.dataReady()) {
-    float temp = tmpSensor.readTempC();
-    Serial.print("Temperature: ");
-    Serial.print(temp, 2);
-    Serial.println("°C");
-    return temp;
-  }
-  Serial.println("Temperature sensor not ready");
-  return 0.0;
+float readTemp() {
+  return tmpSensor.dataReady() ? tmpSensor.readTempC() : 36.6f;
 }
 
-bool readPPG(SensorData& data) {
-  Serial.println("Starting PPG collection...");
-  
-  // Clear the sensor buffer
-  while (ppgSensor.available()) {
-    ppgSensor.getIR();
-    ppgSensor.getRed();
-  }
-  
-  // Collect samples
-  uint32_t irBuffer[PPG_SAMPLES_NEEDED];
-  uint32_t redBuffer[PPG_SAMPLES_NEEDED];
-  int sampleCount = 0;
-  
-  unsigned long startTime = millis();
-  
-  while (sampleCount < PPG_SAMPLES_NEEDED && 
-         (millis() - startTime) < PPG_SAMPLE_WINDOW_MS + 1000) {
-    
+bool readPPG(SensorData& d) {
+  while (ppgSensor.available()) { ppgSensor.getIR(); ppgSensor.getRed(); }
+  uint32_t buf[PPG_SAMPLES_NEEDED];
+  int n = 0;
+  unsigned long t0 = millis();
+  while (n < PPG_SAMPLES_NEEDED && (millis() - t0) < PPG_SAMPLE_MS + 1000) {
     if (ppgSensor.available()) {
-      irBuffer[sampleCount] = ppgSensor.getIR();
-      redBuffer[sampleCount] = ppgSensor.getRed();
-      sampleCount++;
-      
-      // Show progress every 50 samples
-      if (sampleCount % 50 == 0) {
-        Serial.print("PPG samples collected: ");
-        Serial.print(sampleCount);
-        Serial.print("/");
-        Serial.println(PPG_SAMPLES_NEEDED);
+      buf[n++] = ppgSensor.getIR();
+      ppgSensor.getRed();
+    }
+    delay(9);
+  }
+  if (n < PPG_SAMPLES_NEEDED / 2) return false;
+
+  uint32_t sum = 0, mn = 0xFFFFFFFF, mx = 0;
+  for (int i = 0; i < n; i++) {
+    sum += buf[i];
+    if (buf[i] < mn) mn = buf[i];
+    if (buf[i] > mx) mx = buf[i];
+  }
+  d.ppg_raw_dc_baseline = (float)sum / n;
+  d.ppg_raw_ac_p2p      = (float)(mx - mn);
+  d.perfusion_index     = d.ppg_raw_ac_p2p / d.ppg_raw_dc_baseline * 100.0f;
+
+  // Peak-detection heart rate
+  int beats = 0; bool wasHigh = false;
+  float thresh = d.ppg_raw_dc_baseline + d.ppg_raw_ac_p2p * 0.3f;
+  for (int i = 0; i < n; i++) {
+    bool high = buf[i] > thresh;
+    if (high && !wasHigh) beats++;
+    wasHigh = high;
+  }
+  d.hr_bpm       = beats > 0 ? (beats * 60000.0f / PPG_SAMPLE_MS) : 70.0f;
+  d.pulse_width_ms = d.hr_bpm > 0 ? (60000.0f / d.hr_bpm) : 857.0f;
+  return true;
+}
+
+SensorData collectAll() {
+  SensorData d;
+
+  screenStep("pH Probe",           1, 4, false);
+  delay(400);
+  d.saliva_ph = readPH();
+  screenStep("pH Probe",           1, 4, true);
+  delay(300);
+
+  screenStep("Temperature Sensor", 2, 4, false);
+  delay(400);
+  d.temperature_c = readTemp();
+  screenStep("Temperature Sensor", 2, 4, true);
+  delay(300);
+
+  screenStep("PPG (5 sec...)",     3, 4, false);
+  if (!readPPG(d)) {
+    screenError("PPG collection failed", "Keep finger on sensor");
+    return d;
+  }
+  screenStep("PPG Sensor",         3, 4, true);
+  delay(300);
+
+  screenStep("Validating...",      4, 4, false);
+  delay(600);
+  d.valid = (d.saliva_ph > 4.0f && d.saliva_ph < 9.5f &&
+             d.temperature_c > 30.0f && d.temperature_c < 45.0f);
+  screenStep("Validation",         4, 4, true);
+  delay(500);
+  return d;
+}
+
+// =============================================================================
+// ── SUPABASE HELPERS ─────────────────────────────────────────────────────────
+// =============================================================================
+
+String supabaseUrl(const char* path) {
+  return String("https://") + SUPABASE_PROJECT + ".supabase.co/rest/v1/" + path;
+}
+
+void addHeaders(HTTPClient& http) {
+  http.addHeader("Content-Type",  "application/json");
+  http.addHeader("apikey",         SUPABASE_ANON_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
+}
+
+// Insert sensor row with status='pending'; returns the new row id or -1
+long insertPendingRow(const SensorData& d) {
+  HTTPClient http;
+  http.begin(supabaseUrl("readings") + "?select=id");
+  addHeaders(http);
+  http.addHeader("Prefer", "return=representation");   // so Supabase returns the row
+
+  StaticJsonDocument<512> doc;
+  doc["device_id"]            = DEVICE_ID;
+  doc["status"]               = "pending";
+  doc["saliva_ph"]            = d.saliva_ph;
+  doc["hr_bpm"]               = d.hr_bpm;
+  doc["ppg_raw_dc_baseline"]  = d.ppg_raw_dc_baseline;
+  doc["ppg_raw_ac_p2p"]       = d.ppg_raw_ac_p2p;
+  doc["temperature_c"]        = d.temperature_c;
+  doc["perfusion_index"]      = d.perfusion_index;
+  doc["pulse_width_ms"]       = d.pulse_width_ms;
+
+  String body;
+  serializeJson(doc, body);
+
+  int code = http.POST(body);
+  long rowId = -1;
+
+  if (code == 201) {
+    String resp = http.getString();
+    DynamicJsonDocument rdoc(256);
+    if (!deserializeJson(rdoc, resp)) {
+      // Response is a JSON array [ { "id": N } ]
+      rowId = rdoc[0]["id"].as<long>();
+    }
+    Serial.printf("Inserted row id=%ld status=pending\n", rowId);
+  } else {
+    Serial.printf("Insert failed HTTP %d: %s\n", code, http.getString().c_str());
+  }
+  http.end();
+  return rowId;
+}
+
+// Poll for status='complete' on our row; returns true and fills result if ready
+bool pollForResult(long rowId,
+                   char* patientName, size_t nameLen,
+                   float& bgl, float& ciLow, float& ciHigh,
+                   char* zone, size_t zoneLen,
+                   char* category, size_t catLen,
+                   bool& isOod) {
+  HTTPClient http;
+  String url = supabaseUrl("readings") +
+               "?id=eq." + String(rowId) +
+               "&select=status,patient_name,predicted_bgl_mg_dl,"
+               "ci_low_mg_dl,ci_high_mg_dl,clarke_zone,"
+               "glucose_category,is_ood";
+  http.begin(url);
+  addHeaders(http);
+  http.addHeader("Accept", "application/json");
+
+  int code = http.GET();
+  bool done = false;
+
+  if (code == 200) {
+    String resp = http.getString();
+    DynamicJsonDocument doc(512);
+    if (!deserializeJson(doc, resp) && doc.size() > 0) {
+      const char* st = doc[0]["status"] | "pending";
+      if (strcmp(st, "complete") == 0) {
+        strlcpy(patientName, doc[0]["patient_name"] | "", nameLen);
+        bgl    = doc[0]["predicted_bgl_mg_dl"] | 0.0f;
+        ciLow  = doc[0]["ci_low_mg_dl"]        | (bgl - 20.0f);
+        ciHigh = doc[0]["ci_high_mg_dl"]        | (bgl + 20.0f);
+        strlcpy(zone,     doc[0]["clarke_zone"]     | "Zone A", zoneLen);
+        strlcpy(category, doc[0]["glucose_category"]| "Normal", catLen);
+        isOod  = doc[0]["is_ood"] | false;
+        done = true;
+        Serial.printf("Poll: complete! BGL=%.1f zone=%s\n", bgl, zone);
       }
     }
-    delay(10);
-  }
-  
-  if (sampleCount < PPG_SAMPLES_NEEDED / 2) {
-    Serial.println("ERROR: Insufficient PPG samples collected");
-    return false;
-  }
-  
-  // Process the collected data
-  uint32_t irSum = 0;
-  uint32_t irMin = 4294967295U;
-  uint32_t irMax = 0;
-  
-  for (int i = 0; i < sampleCount; i++) {
-    irSum += irBuffer[i];
-    if (irBuffer[i] < irMin) irMin = irBuffer[i];
-    if (irBuffer[i] > irMax) irMax = irBuffer[i];
-  }
-  
-  // Calculate metrics
-  data.ppg_raw_dc_baseline = (float)irSum / sampleCount;
-  data.ppg_raw_ac_p2p = (float)(irMax - irMin);
-  data.perfusion_index = (data.ppg_raw_ac_p2p / data.ppg_raw_dc_baseline) * 100.0;
-  
-  // Simple heart rate detection
-  data.hr_bpm = 0.0;
-  int beatCount = 0;
-  bool lastBeat = false;
-  
-  for (int i = 1; i < sampleCount - 1; i++) {
-    bool currentBeat = (irBuffer[i] > irBuffer[i-1] && irBuffer[i] > irBuffer[i+1] && 
-                       irBuffer[i] > (data.ppg_raw_dc_baseline + data.ppg_raw_ac_p2p * 0.3));
-    
-    if (currentBeat && !lastBeat) {
-      beatCount++;
-    }
-    lastBeat = currentBeat;
-  }
-  
-  if (beatCount > 0) {
-    data.hr_bpm = (beatCount * 60.0 * 1000.0) / PPG_SAMPLE_WINDOW_MS;
-    data.pulse_width_ms = (float)PPG_SAMPLE_WINDOW_MS / beatCount;
   } else {
-    data.hr_bpm = 70.0;  // Default fallback
-    data.pulse_width_ms = 857.0;  // 60000ms / 70bpm
+    Serial.printf("Poll HTTP %d\n", code);
   }
-  
-  Serial.print("PPG Results - DC: ");
-  Serial.print(data.ppg_raw_dc_baseline, 1);
-  Serial.print(", AC: ");
-  Serial.print(data.ppg_raw_ac_p2p, 1);
-  Serial.print(", PI: ");
-  Serial.print(data.perfusion_index, 2);
-  Serial.print("%, HR: ");
-  Serial.print(data.hr_bpm, 1);
-  Serial.print(" bpm, PW: ");
-  Serial.print(data.pulse_width_ms, 1);
-  Serial.println(" ms");
-  
-  return true;
+  http.end();
+  return done;
 }
-SensorData collectAllSensors() {
-  SensorData data;
-  data.valid = false;
-  
-  Serial.println("=== Starting sensor collection sequence ===");
-  
-  // Step 1: pH reading
-  drawSensorProgress("pH Probe", 1, 4);
-  delay(1000);
-  data.saliva_ph = readpH();
-  drawSensorProgress("pH Probe", 1, 4, true);
-  delay(500);
-  
-  // Step 2: Temperature reading  
-  drawSensorProgress("Temperature Sensor", 2, 4);
-  delay(1000);
-  data.temperature_c = readTemperature();
-  drawSensorProgress("Temperature Sensor", 2, 4, true);
-  delay(500);
-  
-  // Step 3: PPG reading (longest step)
-  drawSensorProgress("PPG Sensor (5 sec)", 3, 4);
-  delay(500);
-  
-  if (!readPPG(data)) {
-    Serial.println("ERROR: PPG reading failed");
-    drawSensorProgress("PPG Sensor - FAILED", 3, 4);
-    delay(2000);
-    return data;
-  }
-  
-  drawSensorProgress("PPG Sensor", 3, 4, true);
-  delay(500);
-  
-  // Step 4: Final validation
-  drawSensorProgress("Validating Data", 4, 4);
-  delay(1000);
-  
-  // Validate ranges
-  bool valid = true;
-  if (data.saliva_ph < 4.0 || data.saliva_ph > 9.0) {
-    Serial.println("WARNING: pH out of expected range");
-    valid = false;
-  }
-  if (data.temperature_c < 30.0 || data.temperature_c > 45.0) {
-    Serial.println("WARNING: Temperature out of expected range");
-    valid = false;
-  }
-  if (data.hr_bpm < 40.0 || data.hr_bpm > 200.0) {
-    Serial.println("WARNING: Heart rate out of expected range");
-  }
-  
-  data.valid = valid;
-  drawSensorProgress("Validation Complete", 4, 4, true);
-  delay(1000);
-  
-  Serial.println("=== Sensor collection complete ===");
-  return data;
-}
-// ── Network Functions ───────────────────────────────────────────────────────
-bool uploadToSupabase(const SensorData& data) {
-  if (!data.valid) {
-    Serial.println("Cannot upload invalid sensor data");
-    return false;
-  }
-  
-  HTTPClient http;
-  String url = "https://" + String(SUPABASE_PROJECT) + ".supabase.co/rest/v1/readings";
-  
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
-  http.addHeader("apikey", String(SUPABASE_ANON_KEY));
-  http.addHeader("Prefer", "return=minimal");
-  
-  // Create JSON payload
-  StaticJsonDocument<512> doc;
-  doc["device_id"] = String(DEVICE_ID);
-  doc["saliva_ph"] = data.saliva_ph;
-  doc["hr_bpm"] = data.hr_bpm;
-  doc["ppg_raw_dc_baseline"] = data.ppg_raw_dc_baseline;
-  doc["ppg_raw_ac_p2p"] = data.ppg_raw_ac_p2p;
-  doc["temperature_c"] = data.temperature_c;
-  doc["perfusion_index"] = data.perfusion_index;
-  doc["pulse_width_ms"] = data.pulse_width_ms;
-  doc["timestamp"] = "now()";  // PostgreSQL function
-  
-  String jsonString;
-  serializeJson(doc, jsonString);
-  
-  Serial.println("Uploading to Supabase...");
-  Serial.println("URL: " + url);
-  Serial.println("Payload: " + jsonString);
-  
-  int httpResponseCode = http.POST(jsonString);
-  
-  if (httpResponseCode == 201) {
-    Serial.println("✓ Upload successful");
-    http.end();
-    return true;
-  } else {
-    Serial.print("✗ Upload failed - HTTP ");
-    Serial.println(httpResponseCode);
-    String response = http.getString();
-    Serial.println("Response: " + response);
-    http.end();
-    return false;
-  }
-}
+
+// =============================================================================
+// ── WEB SERVER (dashboard remote trigger) ────────────────────────────────────
+// =============================================================================
 
 void handleStartReading() {
   if (readingInProgress) {
     server.send(409, "application/json", "{\"error\":\"Reading already in progress\"}");
     return;
   }
-  
-  Serial.println("Remote reading request received from dashboard");
-  
-  server.send(200, "application/json", "{\"status\":\"started\",\"message\":\"Sensor reading initiated\"}");
-  
-  // Start reading in next loop iteration
-  buttonPressed = true;
+  server.send(200, "application/json",
+              "{\"status\":\"started\",\"message\":\"Sensor reading initiated\"}");
+  triggerReading = true;
 }
 
-void handleGetStatus() {
+void handleStatus() {
   StaticJsonDocument<300> doc;
-  doc["device_id"] = String(DEVICE_ID);
-  doc["reading_in_progress"] = readingInProgress;
-  doc["wifi_connected"] = (WiFi.status() == WL_CONNECTED);
-  doc["ip_address"] = WiFi.localIP().toString();
-  
-  if (latestReading.valid) {
-    doc["last_reading"]["saliva_ph"] = latestReading.saliva_ph;
-    doc["last_reading"]["hr_bpm"] = latestReading.hr_bpm;
-    doc["last_reading"]["temperature_c"] = latestReading.temperature_c;
-  }
-  
-  String response;
-  serializeJson(doc, response);
-  server.send(200, "application/json", response);
+  doc["device_id"]          = DEVICE_ID;
+  doc["reading_in_progress"]= readingInProgress;
+  doc["wifi_connected"]     = (WiFi.status() == WL_CONNECTED);
+  doc["ip_address"]         = WiFi.localIP().toString();
+  doc["last_row_id"]        = currentRowId;
+  String r; serializeJson(doc, r);
+  server.send(200, "application/json", r);
 }
 
-void setupWebServer() {
-  server.on("/start_reading", HTTP_POST, handleStartReading);
-  server.on("/status", HTTP_GET, handleGetStatus);
-  
-  server.begin();
-  Serial.print("Web server started on http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("/");
-}
-// ── Button Handling ─────────────────────────────────────────────────────────
-void checkButton() {
-  if (millis() - lastButtonCheck < buttonDebounceMs) {
+// =============================================================================
+// ── MAIN READING FLOW ────────────────────────────────────────────────────────
+// =============================================================================
+
+void doReading() {
+  readingInProgress = true;
+  triggerReading    = false;
+
+  Serial.println("=== Starting reading sequence ===");
+
+  // ── Phase 1: collect sensors ──
+  SensorData d = collectAll();
+  if (!d.valid) {
+    screenError("Sensor data invalid", "Check connections & retry");
+    readingInProgress = false;
+    delay(3000);
+    screenHome();
     return;
   }
-  
-  if (digitalRead(BUTTON_PIN) == LOW && !readingInProgress) {
-    buttonPressed = true;
-    lastButtonCheck = millis();
-    Serial.println("Button pressed - starting reading");
+
+  // ── Phase 2: upload to Supabase (status=pending) ──
+  tft.fillRect(4, 180, 232, 30, C_BG);
+  tft.setTextColor(C_YELLOW); tft.setTextSize(1);
+  tft.setCursor(10, 182); tft.print("Uploading to cloud...");
+
+  long rowId = insertPendingRow(d);
+  if (rowId < 0) {
+    screenError("Supabase upload failed", "Check WiFi & credentials");
+    readingInProgress = false;
+    delay(3000);
+    screenHome();
+    return;
   }
+  currentRowId = rowId;
+
+  // ── Phase 3: show "waiting for user details" screen ──
+  delay(500);
+  screenWaitingUser(rowId);
+
+  // ── Phase 4: poll until dashboard sets status='complete' ──
+  unsigned long pollStart = millis();
+  int elapsed = 0;
+
+  char patientName[64] = "";
+  float bgl = 0, ciLow = 0, ciHigh = 0;
+  char zone[32] = "Zone A";
+  char category[32] = "Normal";
+  bool isOod = false;
+  bool gotResult = false;
+
+  while ((millis() - pollStart) < POLL_TIMEOUT_MS) {
+    delay(POLL_INTERVAL_MS);
+    elapsed = (millis() - pollStart) / 1000;
+
+    screenPolling(rowId, elapsed);
+
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+      delay(2000);
+      continue;
+    }
+
+    gotResult = pollForResult(rowId,
+                              patientName, sizeof(patientName),
+                              bgl, ciLow, ciHigh,
+                              zone, sizeof(zone),
+                              category, sizeof(category),
+                              isOod);
+    if (gotResult) break;
+  }
+
+  // ── Phase 5: show results ──
+  if (gotResult) {
+    Serial.printf("Result: %s  BGL=%.1f  Zone=%s\n", patientName, bgl, zone);
+    screenResults(patientName, bgl, ciLow, ciHigh, zone, category, isOod);
+    delay(30000);  // show results for 30 seconds
+  } else {
+    screenError("Timeout: no response", "User did not submit in 5min");
+    delay(4000);
+  }
+
+  readingInProgress = false;
+  screenHome();
+  Serial.println("=== Reading cycle complete ===");
 }
 
-void performReading() {
-  if (!readingInProgress) {
-    readingInProgress = true;
-    
-    Serial.println(">>> Starting sensor reading sequence <<<");
-    
-    // Collect all sensor data with progress display
-    latestReading = collectAllSensors();
-    
-    if (latestReading.valid) {
-      // Display results on screen
-      drawSensorResults(latestReading);
-      
-      // Upload to cloud
-      bool uploadSuccess = uploadToSupabase(latestReading);
-      
-      if (!uploadSuccess) {
-        // Update display to show upload error
-        tft.fillRect(10, 180, 220, 50, COLOR_BG);
-        tft.drawRect(10, 180, 220, 50, COLOR_BORDER);
-        tft.setTextColor(COLOR_ERROR);
-        tft.setTextSize(1);
-        tft.setCursor(15, 190);
-        tft.print("Upload Failed!");
-        tft.setTextColor(COLOR_LABEL);
-        tft.setCursor(15, 205);
-        tft.print("Check WiFi connection");
-        tft.setCursor(15, 220);
-        tft.print("Data saved locally");
-      }
-      
-    } else {
-      // Show error screen
-      tft.fillScreen(COLOR_BG);
-      drawBorder();
-      tft.setTextColor(COLOR_ERROR);
-      tft.setTextSize(2);
-      tft.setCursor(50, 100);
-      tft.print("SENSOR ERROR");
-      
-      tft.setTextColor(COLOR_LABEL);
-      tft.setTextSize(1);
-      tft.setCursor(10, 140);
-      tft.print("Check sensor connections");
-      tft.setCursor(10, 160);
-      tft.print("Press button to retry");
-    }
-    
-    readingInProgress = false;
-    buttonPressed = false;
-    
-    // Return to welcome screen after 10 seconds
-    delay(10000);
-    drawWelcomeScreen();
-  }
-}
-// ── Main Setup and Loop ─────────────────────────────────────────────────────
+// =============================================================================
+// ── SETUP ────────────────────────────────────────────────────────────────────
+// =============================================================================
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== ESP32-S3 Glucose Monitor Starting ===");
-  
-  // Initialize display first for user feedback
-  initDisplay();
-  
-  // Show startup message
-  tft.fillScreen(COLOR_BG);
-  drawBorder();
-  tft.setTextColor(COLOR_TITLE);
-  tft.setTextSize(2);
-  tft.setCursor(40, 50);
-  tft.print("Initializing...");
-  
-  // Initialize button
+  Serial.println("\n=== ESP32-S3 Glucose Monitor ===");
+
+  // Display first so user sees feedback immediately
+  pinMode(TFT_BLK, OUTPUT);
+  digitalWrite(TFT_BLK, HIGH);
+  tft.init(240, 240);
+  tft.setRotation(0);
+  tftClear();
+
+  // Startup screen
+  drawChrome("Initialising...", 0x000F, C_CYAN);
+  tft.setTextColor(C_GREY); tft.setTextSize(1);
+  tft.setCursor(10, 48); tft.print("Starting sensors...");
+
+  // Button
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  
-  // Initialize sensors
-  tft.setTextColor(COLOR_LABEL);
-  tft.setTextSize(1);
-  tft.setCursor(10, 90);
-  tft.print("Starting sensors...");
-  
+
+  // Sensors
   if (!initSensors()) {
-    tft.setTextColor(COLOR_ERROR);
-    tft.setCursor(10, 110);
-    tft.print("SENSOR INIT FAILED!");
-    tft.setCursor(10, 130);
-    tft.print("Check I2C connections");
-    while (1) delay(1000);  // Stop here if sensors fail
+    screenError("Sensor init failed", "Check I2C wiring");
+    while (true) delay(1000);
   }
-  
-  tft.setTextColor(COLOR_SUCCESS);
-  tft.setCursor(10, 110);
-  tft.print("Sensors OK");
-  
-  // Connect to WiFi
-  tft.setTextColor(COLOR_LABEL);
-  tft.setCursor(10, 130);
-  tft.print("Connecting to WiFi...");
-  
+  tft.setTextColor(C_GREEN); tft.setCursor(10, 62); tft.print("[OK] Sensors ready");
+
+  // WiFi
+  tft.setTextColor(C_GREY); tft.setCursor(10, 78); tft.print("Connecting WiFi...");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries++ < 24) { delay(500); Serial.print("."); }
+
   if (WiFi.status() == WL_CONNECTED) {
-    tft.setTextColor(COLOR_SUCCESS);
-    tft.setCursor(10, 150);
-    tft.print("WiFi Connected");
-    tft.setCursor(10, 170);
-    tft.print(WiFi.localIP());
-    
-    Serial.println("\nWiFi connected!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    
-    setupWebServer();
+    tft.setTextColor(C_GREEN); tft.setCursor(10, 92);  tft.print("[OK] WiFi connected");
+    tft.setTextColor(C_CYAN);  tft.setCursor(10, 106); tft.print(WiFi.localIP().toString().c_str());
+    Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
+
+    // Web server
+    server.on("/start_reading", HTTP_POST, handleStartReading);
+    server.on("/status",        HTTP_GET,  handleStatus);
+    server.begin();
+    Serial.println("Web server started");
+    tft.setTextColor(C_GREEN); tft.setCursor(10, 120); tft.print("[OK] Web server ready");
   } else {
-    tft.setTextColor(COLOR_ERROR);
-    tft.setCursor(10, 150);
-    tft.print("WiFi Failed");
-    tft.setCursor(10, 170);
-    tft.print("Check credentials");
-    Serial.println("\nWiFi connection failed");
+    tft.setTextColor(C_ORANGE); tft.setCursor(10, 92); tft.print("[!] WiFi failed — offline");
+    Serial.println("\nWiFi failed");
   }
-  
-  delay(2000);
-  
-  // Initialize sensor data structure
-  latestReading.valid = false;
-  
-  // Show welcome screen
-  drawWelcomeScreen();
-  
-  Serial.println("=== Setup complete - ready for readings ===");
+
+  delay(1500);
+  screenHome();
+  Serial.println("Setup complete — waiting for button press");
 }
 
+// =============================================================================
+// ── LOOP ─────────────────────────────────────────────────────────────────────
+// =============================================================================
 void loop() {
-  // Handle web server requests
   server.handleClient();
-  
-  // Check for button press
-  checkButton();
-  
-  // Process reading if triggered
-  if (buttonPressed && !readingInProgress) {
-    performReading();
+
+  // Debounced button check
+  if (!readingInProgress) {
+    bool btnDown = (digitalRead(BUTTON_PIN) == LOW);
+    if (btnDown && (millis() - lastButtonTime > 300)) {
+      lastButtonTime = millis();
+      triggerReading = true;
+      Serial.println("Button pressed");
+    }
   }
-  
-  // Keep WiFi alive
+
+  if (triggerReading && !readingInProgress) {
+    doReading();
+  }
+
+  // WiFi watchdog
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnected, attempting reconnection...");
     WiFi.reconnect();
   }
-  
-  delay(50);  // Small delay for responsiveness
+
+  delay(50);
 }

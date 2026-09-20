@@ -1,679 +1,629 @@
 """
-Non-Invasive Blood Glucose Prediction System
-Live Sensor Dashboard — Supabase-connected extension
-
-This file adds a "Live Sensor Mode" on top of the existing dashboard UI.
-It DOES NOT modify app/dashboard.py or scripts/predict.py.
-
-Architecture:
-  ESP32-S3 → Supabase REST (INSERT) → this dashboard (SELECT) → predict()
-
-Secrets (set in .streamlit/secrets.toml locally, or in Streamlit Cloud):
-  [supabase]
-  url  = "https://YOUR_PROJECT.supabase.co"
-  key  = "YOUR_ANON_KEY"
+Non-Invasive Blood Glucose — Live Sensor Dashboard
+====================================================
+Step-by-step flow:
+  1. ESP32 presses button → collects sensors → inserts row with status='pending'
+  2. This dashboard detects the pending row and shows a user-details form
+  3. User fills name / age / BMI / etc. and clicks Submit
+  4. Dashboard runs predict(), patches row to status='complete' with results
+  5. ESP32 polls Supabase, finds status='complete', shows results on TFT display
 
 Run locally:   streamlit run app/live_dashboard.py
-Deploy:        point a second Streamlit Cloud app at this file in the same repo
+Deploy:        streamlit run streamlit_app.py  (Streamlit Cloud entry point)
 """
-
 from __future__ import annotations
 
-import os
 import sys
-import json
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
-import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
 
-# ── path setup (same as dashboard.py) ────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
 from predict import GlucosePredictor
-from app.supabase_client import create_client, get_latest_reading, get_reading_history, patch_reading
+from app.supabase_client import (
+    create_client, get_pending_reading,
+    get_latest_reading, get_reading_history, patch_reading,
+)
 
-# ── page config ───────────────────────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Non-Invasive Glucose — Live Sensor Dashboard",
-    page_icon="📡",
+    page_title="Glucose Monitor — Live",
+    page_icon="💉",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── shared CSS (same palette as dashboard.py) ─────────────────────────────────
-st.html("""
-<style>
-    .glucose-card {
-        background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
-        border-radius: 15px;
-        border: 2px solid #64748b;
-        padding: 20px;
-        margin: 15px 0;
-        text-align: center;
-        box-shadow: 0 8px 25px rgba(0,0,0,0.3);
-    }
-    .glucose-normal { border-color: #22c55e !important; }
-    .glucose-prediabetic { border-color: #f59e0b !important; }
-    .glucose-diabetic { border-color: #ef4444 !important; }
-    .metric-card { 
-        background: #1e293b; 
-        border: 1px solid #475569; 
-        border-radius: 10px;
-        padding: 15px; 
-        margin: 8px 0;
-        text-align: center;
-    }
-    .sensor-value { font-size: 1.2em; font-weight: bold; color: #e2e8f0; }
-    .sensor-unit { font-size: 0.9em; color: #94a3b8; margin-left: 5px; }
-    .ts-small { font-size: 0.85em; color: #94a3b8; }
-    .esp32-status {
-        background: #0f172a;
-        border: 1px solid #334155;
-        border-radius: 8px;
-        padding: 12px;
-        margin: 10px 0;
-    }
-    .status-online { border-color: #22c55e !important; }
-    .status-offline { border-color: #ef4444 !important; }
-    .status-reading { border-color: #3b82f6 !important; }
-</style>
-""")
-
-# ── ESP32 Device Control Functions ──────────────────────────────────────────
-def get_esp32_status(device_ip: str) -> Dict[str, Any]:
-    """Get ESP32 device status via HTTP"""
-    try:
-        response = requests.get(f"http://{device_ip}/status", timeout=5)
-        if response.status_code == 200:
-            return {"online": True, "data": response.json()}
-        else:
-            return {"online": False, "error": f"HTTP {response.status_code}"}
-    except requests.exceptions.RequestException as e:
-        return {"online": False, "error": str(e)}
-
-def trigger_esp32_reading(device_ip: str) -> Dict[str, Any]:
-    """Trigger a new sensor reading on ESP32"""
-    try:
-        response = requests.post(f"http://{device_ip}/start_reading", timeout=10)
-        if response.status_code == 200:
-            return {"success": True, "data": response.json()}
-        elif response.status_code == 409:
-            return {"success": False, "error": "Reading already in progress"}
-        else:
-            return {"success": False, "error": f"HTTP {response.status_code}"}
-    except requests.exceptions.RequestException as e:
-        return {"success": False, "error": str(e)}
-
-def render_esp32_control_panel(sb):
-    """Render ESP32 device control panel"""
-    st.markdown("#### 📡 ESP32 Device Control")
-    
-    # Device IP input (saved in session state)
-    if "esp32_ip" not in st.session_state:
-        st.session_state.esp32_ip = "192.168.1.100"  # Default IP
-    
-    col_ip, col_status, col_trigger = st.columns([2, 2, 2])
-    
-    with col_ip:
-        device_ip = st.text_input("ESP32 IP Address:", 
-                                 value=st.session_state.esp32_ip,
-                                 key="esp32_ip_input",
-                                 help="Enter the ESP32's local network IP address")
-        st.session_state.esp32_ip = device_ip
-    
-    with col_status:
-        check_status_btn = st.button("🔍 Check Device Status")
-        
-    with col_trigger:
-        trigger_reading_btn = st.button("🚀 Start Remote Reading", type="primary")
-    
-    # Status display
-    if check_status_btn or "esp32_status" not in st.session_state:
-        with st.spinner(f"Checking device at {device_ip}..."):
-            status = get_esp32_status(device_ip)
-            st.session_state.esp32_status = status
-    
-    if "esp32_status" in st.session_state:
-        status = st.session_state.esp32_status
-        
-        if status["online"]:
-            data = status["data"]
-            status_class = "status-reading" if data.get("reading_in_progress") else "status-online"
-            
-            st.markdown(f"""
-            <div class="esp32-status {status_class}">
-                <strong>🟢 Device Online</strong> — {device_ip}<br>
-                Device ID: {data.get('device_id', '—')}<br>
-                Reading in progress: {"Yes" if data.get('reading_in_progress') else "No"}<br>
-                WiFi: {"Connected" if data.get('wifi_connected') else "Disconnected"}
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div class="esp32-status status-offline">
-                <strong>🔴 Device Offline</strong><br>
-                Error: {status.get('error', 'Unknown error')}<br>
-                Check IP address and network connection
-            </div>
-            """, unsafe_allow_html=True)
-    
-    # Remote reading trigger
-    if trigger_reading_btn:
-        if "esp32_status" not in st.session_state or not st.session_state.esp32_status["online"]:
-            st.error("❌ Cannot trigger reading: Device is offline. Check device status first.")
-        else:
-            with st.spinner(f"Triggering reading on {device_ip}..."):
-                result = trigger_esp32_reading(device_ip)
-                
-                if result["success"]:
-                    st.success("✅ Reading started successfully! The ESP32 will collect sensor data and upload to Supabase.")
-                    st.info("💡 **Tip:** Wait 10-15 seconds, then click 'Fetch Latest Reading' to see the new data.")
-                    # Clear cached status to force refresh
-                    if "esp32_status" in st.session_state:
-                        del st.session_state.esp32_status
-                else:
-                    st.error(f"❌ Failed to start reading: {result['error']}")
-    
-    st.markdown("---")
-
-# ── original CSS (combined above) ─────────────────────────────────────────────
+# ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  .main-title  { font-size:2.1rem; font-weight:800; color:#1e3a8a; }
-  .sub-title   { font-size:1.0rem; color:#475569; margin-bottom:1rem; }
-  .live-badge  { background:linear-gradient(135deg,#16a34a,#4ade80);
-                 color:#fff; padding:6px 14px; border-radius:8px;
-                 font-weight:700; font-size:.88rem; display:inline-block; }
-  .manual-badge{ background:linear-gradient(135deg,#1e3a8a,#0284c7);
-                 color:#fff; padding:6px 14px; border-radius:8px;
-                 font-weight:700; font-size:.88rem; display:inline-block; }
-  .sensor-card { background:#0f172a; border:1px solid #334155;
-                 border-radius:10px; padding:14px 18px; margin-bottom:8px; }
-  .sensor-label{ color:#94a3b8; font-size:.78rem; text-transform:uppercase;
-                 letter-spacing:.05em; }
-  .sensor-value{ color:#f1f5f9; font-size:1.4rem; font-weight:700; }
-  .sensor-unit { color:#64748b; font-size:.82rem; margin-left:4px; }
-  .ts-small    { color:#64748b; font-size:.80rem; }
-  .ood-banner  { background:#7f1d1d; border-left:4px solid #ef4444;
-                 padding:10px 14px; border-radius:6px; color:#fca5a5;
-                 margin:8px 0; font-size:.88rem; }
+  /* Page */
+  .main-title  { font-size:2rem; font-weight:800; color:#0ea5e9; }
+  .sub-title   { font-size:.95rem; color:#64748b; margin-bottom:.5rem; }
+
+  /* Status badges */
+  .badge-pending  { background:#92400e; color:#fef3c7;
+                    padding:6px 14px; border-radius:6px;
+                    font-weight:700; font-size:.85rem; display:inline-block; }
+  .badge-live     { background:#065f46; color:#d1fae5;
+                    padding:6px 14px; border-radius:6px;
+                    font-weight:700; font-size:.85rem; display:inline-block; }
+  .badge-manual   { background:#1e3a8a; color:#dbeafe;
+                    padding:6px 14px; border-radius:6px;
+                    font-weight:700; font-size:.85rem; display:inline-block; }
+
+  /* Sensor reading cards */
+  .sc { background:#0f172a; border:1px solid #334155; border-radius:10px;
+        padding:12px 16px; margin-bottom:6px; }
+  .sl { color:#94a3b8; font-size:.75rem; text-transform:uppercase;
+        letter-spacing:.05em; margin-bottom:2px; }
+  .sv { color:#f1f5f9; font-size:1.35rem; font-weight:700; }
+  .su { color:#64748b; font-size:.78rem; margin-left:3px; }
+
+  /* Step pipeline display */
+  .step-done    { color:#22c55e; font-weight:700; }
+  .step-active  { color:#fbbf24; font-weight:700; }
+  .step-waiting { color:#475569; }
+
+  /* Result headline */
+  .result-box { background:#0f172a; border:2px solid #334155;
+                border-radius:14px; padding:22px; margin:12px 0;
+                text-align:center; }
+  .result-normal   { border-color:#22c55e !important; }
+  .result-pre      { border-color:#f59e0b !important; }
+  .result-high     { border-color:#f97316 !important; }
+  .result-danger   { border-color:#ef4444 !important; }
+
+  /* OOD */
+  .ood-warn { background:#7f1d1d; border-left:4px solid #ef4444;
+              padding:10px 14px; border-radius:6px; color:#fca5a5;
+              margin:8px 0; font-size:.88rem; }
+  .ts-small { color:#64748b; font-size:.78rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── predictor singleton ───────────────────────────────────────────────────────
+# ── Singletons ────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model…")
 def load_predictor() -> GlucosePredictor:
     return GlucosePredictor()
 
-predictor = load_predictor()
-
-# ── Supabase client (cached; None if secrets missing) ─────────────────────────
 @st.cache_resource(show_spinner=False)
-def load_supabase_client():
+def load_sb():
     try:
         url = st.secrets["supabase"]["url"]
         key = st.secrets["supabase"]["key"]
         return create_client(url, key)
-    except Exception as exc:
-        return None   # secrets not configured — live mode will show an error
+    except Exception:
+        return None
 
-sb = load_supabase_client()
+predictor = load_predictor()
+sb = load_sb()
+
+# ── ESP32 HTTP helpers ────────────────────────────────────────────────────────
+def esp32_status(ip: str) -> Dict[str, Any]:
+    try:
+        r = requests.get(f"http://{ip}/status", timeout=5)
+        return {"online": True, "data": r.json()} if r.status_code == 200 \
+               else {"online": False, "error": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"online": False, "error": str(e)}
+
+def esp32_trigger(ip: str) -> Dict[str, Any]:
+    try:
+        r = requests.post(f"http://{ip}/start_reading", timeout=10)
+        if r.status_code == 200:   return {"ok": True}
+        if r.status_code == 409:   return {"ok": False, "error": "Already reading"}
+        return {"ok": False, "error": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ── Glucose category helper ───────────────────────────────────────────────────
+def glucose_category(bgl: float) -> str:
+    if bgl < 70:   return "Hypoglycemia"
+    if bgl < 100:  return "Normal"
+    if bgl < 126:  return "Prediabetes"
+    if bgl < 180:  return "Elevated"
+    return "Hyperglycemia"
+
+def bgl_color(bgl: float) -> str:
+    if bgl < 70 or bgl >= 180: return "#ef4444"
+    if bgl >= 126:              return "#f97316"
+    if bgl >= 100:              return "#f59e0b"
+    return "#22c55e"
 
 # =============================================================================
-# HEADER
+# ── HEADER ───────────────────────────────────────────────────────────────────
 # =============================================================================
-st.markdown("<div class='main-title'>📡 Non-Invasive Blood Glucose — Live Sensor Dashboard</div>",
+st.markdown("<div class='main-title'>💉 Non-Invasive Blood Glucose — Live Dashboard</div>",
             unsafe_allow_html=True)
-st.markdown("<div class='sub-title'>Real-time inference from ESP32-S3 sensor node via Supabase</div>",
+st.markdown("<div class='sub-title'>ESP32-S3 sensor node → Supabase → real-time prediction</div>",
             unsafe_allow_html=True)
 
-# ── Mode toggle ───────────────────────────────────────────────────────────────
-mode = st.radio(
-    "Input Mode",
-    options=["🔴 Live Sensor Mode (ESP32 → Supabase)", "✏️ Manual Entry (same as main dashboard)"],
-    horizontal=True,
-    help="Live mode fetches the latest reading inserted by the ESP32. Manual mode lets you type values directly.",
-)
+mode = st.radio("Mode", ["🔴 Live Sensor Mode", "✏️ Manual Entry"],
+                horizontal=True)
 is_live = mode.startswith("🔴")
-
 st.markdown("---")
 
 # =============================================================================
-# ── SIDEBAR: patient context (both modes) ─────────────────────────────────────
-# =============================================================================
-with st.sidebar:
-    st.markdown("### 🧑‍⚕️ Patient Context")
-    st.caption("These demographic fields supplement sensor data for the prediction model. "
-               "They are stored with each reading (Live mode) or used locally (Manual mode).")
-
-    patient_name_input = st.text_input("Patient / Subject Name", value="",
-                                       placeholder="Jane Doe")
-    age_input     = st.number_input("Age (years)",  min_value=18, max_value=100, value=45)
-    gender_input  = st.selectbox("Biological Gender", ["Male", "Female"])
-    height_input  = st.number_input("Height (cm)", min_value=100.0, max_value=220.0, value=170.0, step=0.5)
-    weight_input  = st.number_input("Weight (kg)", min_value=30.0,  max_value=200.0, value=70.0, step=0.5)
-    computed_bmi  = round(weight_input / ((height_input / 100) ** 2), 1)
-    st.markdown(f"**BMI:** {computed_bmi} kg/m²")
-
-    diagnosis_input = st.selectbox(
-        "Clinical Diagnosis",
-        ["None / Unknown", "Prediabetes", "Type 1 Diabetes", "Type 2 Diabetes"],
-    )
-    diag_map = {"None / Unknown": "None", "Prediabetes": "Prediabetes",
-                "Type 1 Diabetes": "Type 1", "Type 2 Diabetes": "Type 2"}
-    diag_clean = diag_map[diagnosis_input]
-
-    fasting_input    = st.selectbox("Fasting State", ["Fasting", "Non-Fasting"])
-    fasting_val      = 1 if fasting_input == "Fasting" else 0
-    insulin_input    = st.checkbox("Taking Insulin")
-    oral_input       = st.checkbox("Taking Oral Medication")
-    family_hist      = st.checkbox("Family History of Diabetes")
-    smoking_input    = st.checkbox("Smoker")
-
-    st.markdown("---")
-    st.caption("⚠️ Synthetic-data model only. Not for clinical use.")
-
-# Build demographic context dict (merged into payload for both modes)
-demo_context: Dict[str, Any] = {
-    "age":               float(age_input),
-    "bmi":               float(computed_bmi),
-    "gender":            gender_input.lower(),
-    "diabetes_diagnosis": diag_clean,
-    "fasting":           fasting_val,
-    "med_taking_insulin": int(insulin_input),
-    "med_taking_oral":   int(oral_input),
-    "med_taking_any":    int(insulin_input or oral_input),
-    "family_history":    int(family_hist),
-    "smoking":           int(smoking_input),
-}
-
-# =============================================================================
-# ── LIVE MODE ─────────────────────────────────────────────────────────────────
+# ── LIVE MODE ────────────────────────────────────────────────────────────────
 # =============================================================================
 if is_live:
     if sb is None:
-        st.error(
-            "**Supabase not configured.** "
-            "Add your credentials to `.streamlit/secrets.toml`:\n\n"
-            "```toml\n[supabase]\nurl = \"https://YOUR_PROJECT.supabase.co\"\n"
-            "key = \"YOUR_ANON_KEY\"\n```\n\n"
-            "See SETUP_HARDWARE.md for full instructions."
-        )
+        st.error("Supabase not configured. Add credentials to `.streamlit/secrets.toml`.")
+        st.code("[supabase]\nurl = \"https://mjcwhnkyojfaezydvpsp.supabase.co\"\n"
+                "key = \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...\"", language="toml")
         st.stop()
 
-    st.markdown("<div class='live-badge'>🟢 LIVE — Connected to Supabase</div>",
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP PIPELINE INDICATOR
+    # ─────────────────────────────────────────────────────────────────────────
+    def pipeline_ui(active_step: int):
+        """active_step: 1=waiting for sensor, 2=enter details, 3=done"""
+        steps = ["① Sensor Collection", "② Enter User Details", "③ Prediction Result"]
+        cols = st.columns(3)
+        for i, (col, label) in enumerate(zip(cols, steps), start=1):
+            if i < active_step:
+                col.markdown(f"<div class='step-done'>✅ {label}</div>", unsafe_allow_html=True)
+            elif i == active_step:
+                col.markdown(f"<div class='step-active'>▶ {label}</div>", unsafe_allow_html=True)
+            else:
+                col.markdown(f"<div class='step-waiting'>○ {label}</div>", unsafe_allow_html=True)
+        st.markdown("")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # DEVICE CONTROL PANEL (collapsible)
+    # ─────────────────────────────────────────────────────────────────────────
+    with st.expander("📡 ESP32 Device Control (remote trigger)", expanded=False):
+        if "esp32_ip" not in st.session_state:
+            st.session_state.esp32_ip = "192.168.1.100"
+
+        c1, c2, c3 = st.columns([3, 2, 2])
+        with c1:
+            ip = st.text_input("ESP32 IP Address", value=st.session_state.esp32_ip,
+                               key="ip_input")
+            st.session_state.esp32_ip = ip
+        with c2:
+            if st.button("🔍 Check Status"):
+                st.session_state.dev_status = esp32_status(ip)
+        with c3:
+            if st.button("🚀 Start Remote Reading", type="primary"):
+                res = esp32_trigger(ip)
+                if res["ok"]:
+                    st.success("Reading started on device!")
+                    # clear any cached pending row so we pick up the new one
+                    st.session_state.pop("pending_row", None)
+                else:
+                    st.error(f"Failed: {res.get('error')}")
+
+        if "dev_status" in st.session_state:
+            s = st.session_state.dev_status
+            if s["online"]:
+                d = s["data"]
+                busy = d.get("reading_in_progress", False)
+                st.markdown(
+                    f"🟢 **Online** — Device: `{d.get('device_id','?')}` &nbsp;|&nbsp; "
+                    f"Reading: {'⏳ In progress' if busy else '✅ Idle'} &nbsp;|&nbsp; "
+                    f"Last row: `{d.get('last_row_id','—')}`"
+                )
+            else:
+                st.error(f"🔴 Offline — {s.get('error')}")
+
+    st.markdown("")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AUTO-REFRESH every 8 seconds so pending row is detected automatically
+    # ─────────────────────────────────────────────────────────────────────────
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=8_000, key="live_poll")
+    except ImportError:
+        st.caption("*(install streamlit-autorefresh for automatic polling)*")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CHECK FOR PENDING ROW
+    # ─────────────────────────────────────────────────────────────────────────
+    pending = get_pending_reading(sb)
+
+    # =====================================================================
+    # STEP 1 — No pending row: waiting for ESP32
+    # =====================================================================
+    if pending is None:
+        pipeline_ui(1)
+        st.markdown("<div class='badge-pending'>⏳ WAITING — Press ESP32 Button to Start</div>",
+                    unsafe_allow_html=True)
+        st.markdown("")
+
+        st.info(
+            "**How to start a reading:**\n\n"
+            "• **Physical button:** Press the tactile button on the ESP32 device\n\n"
+            "• **Remote trigger:** Use the Device Control panel above\n\n"
+            "The dashboard will automatically detect the reading within 8 seconds "
+            "and prompt you to fill in patient details."
+        )
+
+        # Show last completed reading if any
+        last = get_latest_reading(sb)
+        if last and last.get("status") == "complete":
+            st.markdown("---")
+            st.markdown("#### 📋 Most Recent Completed Reading")
+            _show_completed_result(last)
+
+        st.stop()
+
+    # =====================================================================
+    # STEP 2 — Pending row found: show sensor values + user details form
+    # =====================================================================
+    pipeline_ui(2)
+    st.markdown("<div class='badge-pending'>📋 STEP 2 — Enter Patient Details to Generate Prediction</div>",
                 unsafe_allow_html=True)
     st.markdown("")
 
-    # ── Refresh controls ──────────────────────────────────────────────────────
-    col_refresh, col_auto, col_spacer = st.columns([2, 3, 5])
-    with col_refresh:
-        fetch_btn = st.button("🔄 Fetch Latest Reading", type="primary")
-    with col_auto:
-        # streamlit-autorefresh: installs via requirements.txt
-        # Default is OFF (manual refresh) to avoid hammering Supabase during demos.
-        try:
-            from streamlit_autorefresh import st_autorefresh
-            auto_on = st.checkbox("⏱ Auto-refresh every 30 s", value=False)
-            if auto_on:
-                st_autorefresh(interval=30_000, key="live_autorefresh")
-        except ImportError:
-            st.caption("*(install streamlit-autorefresh to enable auto-refresh)*")
+    # Timestamp
+    ts_raw = pending.get("created_at", "")
+    try:
+        ts = pd.to_datetime(ts_raw, utc=True).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        ts = str(ts_raw)
 
-    # ── ESP32 Device Control Panel ────────────────────────────────────────────
-    render_esp32_control_panel(sb)
+    st.markdown(
+        f"<div class='ts-small'>📅 Reading received: <b>{ts}</b> &nbsp;·&nbsp; "
+        f"Device: <b>{pending.get('device_id','—')}</b> &nbsp;·&nbsp; "
+        f"Row ID: <b>{pending.get('id','—')}</b></div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("")
 
-    # ── Fetch reading ─────────────────────────────────────────────────────────
-    # Fetch on button press OR on first load (session_state["live_reading"] absent)
-    if fetch_btn or "live_reading" not in st.session_state:
-        with st.spinner("Fetching latest reading from Supabase…"):
-            raw_row = get_latest_reading(sb)
-        if raw_row:
-            st.session_state["live_reading"] = raw_row
+    # ── Sensor values (read-only display) ───────────────────────────────────
+    st.markdown("#### 🔬 Collected Sensor Readings")
+
+    def sc(label, val, unit, fmt=".2f"):
+        if val is None:
+            body = "<span style='color:#475569'>— (fallback)</span>"
         else:
-            st.warning("No readings in the database yet. Press the ESP32 button to take a measurement.")
+            try:    body = f"{float(val):{fmt}}"
+            except: body = str(val)
+        return (f"<div class='sc'><div class='sl'>{label}</div>"
+                f"<div class='sv'>{body}<span class='su'>{unit}</span></div></div>")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(sc("Saliva pH",       pending.get("saliva_ph"),            "pH",   ".3f"), unsafe_allow_html=True)
+    c2.markdown(sc("Heart Rate",      pending.get("hr_bpm"),               "BPM",  ".1f"), unsafe_allow_html=True)
+    c3.markdown(sc("Temperature",     pending.get("temperature_c"),        "°C",   ".2f"), unsafe_allow_html=True)
+    c4.markdown(sc("Perfusion Index", pending.get("perfusion_index"),      "%",    ".3f"), unsafe_allow_html=True)
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.markdown(sc("PPG DC Baseline", pending.get("ppg_raw_dc_baseline"),  "ADC",  ".0f"), unsafe_allow_html=True)
+    c6.markdown(sc("PPG AC Amplitude",pending.get("ppg_raw_ac_p2p"),       "ADC",  ".1f"), unsafe_allow_html=True)
+    c7.markdown(sc("Pulse Width",     pending.get("pulse_width_ms"),       "ms",   ".1f"), unsafe_allow_html=True)
+    c8.markdown(sc("Row ID",          pending.get("id"),                   "",     "d"),   unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── User details form ────────────────────────────────────────────────────
+    st.markdown("#### 👤 Enter Patient Details")
+    st.caption("Fill in the fields below and click **Submit** — the prediction will run "
+               "and results will appear on the ESP32 display within seconds.")
+
+    with st.form("patient_details_form", clear_on_submit=False):
+        fc1, fc2 = st.columns(2)
+
+        with fc1:
+            name_in    = st.text_input("Patient / Subject Name *",
+                                       placeholder="e.g. John Doe")
+            age_in     = st.number_input("Age (years)",  18, 100, 45)
+            gender_in  = st.selectbox("Biological Gender", ["Male", "Female"])
+            diag_in    = st.selectbox("Clinical Diagnosis",
+                                      ["None / Unknown", "Prediabetes",
+                                       "Type 1 Diabetes", "Type 2 Diabetes"])
+
+        with fc2:
+            height_in  = st.number_input("Height (cm)",  100.0, 220.0, 170.0, 0.5)
+            weight_in  = st.number_input("Weight (kg)",   30.0, 200.0,  70.0, 0.5)
+            bmi_calc   = round(weight_in / ((height_in / 100) ** 2), 1)
+            st.markdown(f"**Computed BMI:** {bmi_calc} kg/m²")
+            fasting_in = st.selectbox("Fasting State", ["Fasting", "Non-Fasting"])
+            insulin_in = st.checkbox("Taking Insulin")
+            oral_in    = st.checkbox("Taking Oral Medication")
+            family_in  = st.checkbox("Family History of Diabetes")
+            smoke_in   = st.checkbox("Smoker")
+
+        submitted = st.form_submit_button("⚡ Submit & Generate Prediction",
+                                          type="primary", use_container_width=True)
+
+    # ── On Submit ────────────────────────────────────────────────────────────
+    if submitted:
+        if not name_in.strip():
+            st.warning("Please enter a patient name before submitting.")
             st.stop()
 
-    raw_row: Optional[dict] = st.session_state.get("live_reading")
-    if not raw_row:
-        st.info("Press **Fetch Latest Reading** to load a sensor reading.")
-        st.stop()
+        diag_map = {"None / Unknown":"None","Prediabetes":"Prediabetes",
+                    "Type 1 Diabetes":"Type 1","Type 2 Diabetes":"Type 2"}
 
-    # ── Display raw sensor values ─────────────────────────────────────────────
-    ts_raw = raw_row.get("created_at", "")
-    try:
-        ts_dt  = pd.to_datetime(ts_raw, utc=True).strftime("%Y-%m-%d %H:%M:%S UTC")
-    except Exception:
-        ts_dt  = str(ts_raw)
+        demo: Dict[str, Any] = {
+            "age":                float(age_in),
+            "bmi":                float(bmi_calc),
+            "gender":             gender_in.lower(),
+            "diabetes_diagnosis": diag_map[diag_in],
+            "fasting":            1 if fasting_in == "Fasting" else 0,
+            "med_taking_insulin": int(insulin_in),
+            "med_taking_oral":    int(oral_in),
+            "med_taking_any":     int(insulin_in or oral_in),
+            "family_history":     int(family_in),
+            "smoking":            int(smoke_in),
+        }
 
-    st.markdown(f"<div class='ts-small'>📅 Last reading received: <b>{ts_dt}</b> &nbsp;·&nbsp; "
-                f"Device: <b>{raw_row.get('device_id','—')}</b> &nbsp;·&nbsp; "
-                f"Row ID: <b>{raw_row.get('id','—')}</b></div>",
-                unsafe_allow_html=True)
-    st.markdown("")
+        sensor_fields = ["saliva_ph","hr_bpm","ppg_raw_dc_baseline","ppg_raw_ac_p2p",
+                         "perfusion_index","pulse_width_ms","temperature_c",
+                         "hrv_sdnn","hrv_rmssd","hrv_pnn50","hrv_lf","hrv_hf","hrv_lf_hf_ratio"]
+        sensor: Dict[str, Any] = {
+            f: float(pending[f]) for f in sensor_fields if pending.get(f) is not None
+        }
 
-    st.markdown("#### 🔬 Raw Sensor Values (read-only, from ESP32)")
+        payload = {**demo, **sensor}
 
-    # Six sensor cards in two rows of three
-    def sensor_card(label: str, value, unit: str, fmt: str = ".2f") -> str:
-        if value is None:
-            disp = "<span style='color:#475569'>—  (fallback)</span>"
-        else:
-            try:
-                disp = f"{float(value):{fmt}}"
-            except Exception:
-                disp = str(value)
-        return (
-            f"<div class='sensor-card'>"
-            f"<div class='sensor-label'>{label}</div>"
-            f"<div class='sensor-value'>{disp}"
-            f"<span class='sensor-unit'>{unit}</span></div>"
-            f"</div>"
-        )
+        with st.spinner("Running prediction model…"):
+            result = predictor.predict_full_sensor(payload)
 
-    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-    r1c1.markdown(sensor_card("Saliva pH",        raw_row.get("saliva_ph"),            "pH",   ".3f"), unsafe_allow_html=True)
-    r1c2.markdown(sensor_card("Heart Rate",        raw_row.get("hr_bpm"),               "BPM",  ".1f"), unsafe_allow_html=True)
-    r1c3.markdown(sensor_card("Temperature",       raw_row.get("temperature_c"),        "°C",   ".2f"), unsafe_allow_html=True)
-    r1c4.markdown(sensor_card("Perfusion Index",   raw_row.get("perfusion_index"),      "%",    ".3f"), unsafe_allow_html=True)
+        pred_bgl  = result.get("predicted_bgl_mg_dl", 0.0)
+        ci        = result.get("confidence_interval_5th_95th", [pred_bgl - 20, pred_bgl + 20])
+        zone_str  = result.get("clarke_zone", "Zone A")
+        is_ood    = result.get("is_out_of_distribution", False)
+        ood_warn  = result.get("ood_warning", "")
+        cat       = glucose_category(pred_bgl)
 
-    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
-    r2c1.markdown(sensor_card("PPG DC Baseline",   raw_row.get("ppg_raw_dc_baseline"),  "ADC",  ".0f"), unsafe_allow_html=True)
-    r2c2.markdown(sensor_card("PPG AC Amplitude",  raw_row.get("ppg_raw_ac_p2p"),       "ADC",  ".1f"), unsafe_allow_html=True)
-    r2c3.markdown(sensor_card("Pulse Width",       raw_row.get("pulse_width_ms"),       "ms",   ".1f"), unsafe_allow_html=True)
-
-    # HRV note
-    hrv_present = any(raw_row.get(f) is not None for f in
-                      ["hrv_sdnn","hrv_rmssd","hrv_pnn50","hrv_lf_hf_ratio"])
-    if not hrv_present:
-        r2c4.info("HRV not yet sent by firmware. predict.py uses training-mean fallbacks.")
-    else:
-        r2c4.markdown(sensor_card("HRV SDNN", raw_row.get("hrv_sdnn"), "ms"), unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Build prediction payload ──────────────────────────────────────────────
-    # Merge ESP32 sensor values + sidebar demographic context.
-    # Only include non-None sensor fields — let predict.py handle missing ones
-    # via its documented fallbacks (never pass None explicitly).
-    sensor_payload: Dict[str, Any] = {}
-    sensor_fields = [
-        "saliva_ph", "hr_bpm", "ppg_raw_dc_baseline", "ppg_raw_ac_p2p",
-        "perfusion_index", "pulse_width_ms", "temperature_c",
-        "hrv_sdnn", "hrv_rmssd", "hrv_pnn50", "hrv_lf", "hrv_hf", "hrv_lf_hf_ratio",
-    ]
-    for field in sensor_fields:
-        val = raw_row.get(field)
-        if val is not None:
-            sensor_payload[field] = float(val)
-
-    prediction_payload = {**demo_context, **sensor_payload}
-
-    # ── Run prediction ────────────────────────────────────────────────────────
-    with st.spinner("Running inference…"):
-        result = predictor.predict_full_sensor(prediction_payload)
-
-    # Write prediction back to Supabase row (fire-and-forget)
-    row_id = raw_row.get("id")
-    if row_id:
-        patch_reading(sb, row_id, {
-            "predicted_bgl_mg_dl": result.get("predicted_bgl_mg_dl"),
-            "clarke_zone":         result.get("clarke_zone", ""),
-            "is_ood":              result.get("is_out_of_distribution", False),
-            "patient_name":        patient_name_input.strip() or None,
+        # Patch Supabase row → status='complete'
+        patch_ok = patch_reading(sb, pending["id"], {
+            "status":               "complete",
+            "patient_name":         name_in.strip(),
+            "age":                  float(age_in),
+            "bmi":                  float(bmi_calc),
+            "gender":               gender_in.lower(),
+            "diabetes_diagnosis":   diag_map[diag_in],
+            "fasting":              1 if fasting_in == "Fasting" else 0,
+            "med_taking_insulin":   int(insulin_in),
+            "med_taking_oral":      int(oral_in),
+            "family_history":       int(family_in),
+            "smoking":              int(smoke_in),
+            "predicted_bgl_mg_dl":  pred_bgl,
+            "ci_low_mg_dl":         ci[0],
+            "ci_high_mg_dl":        ci[1],
+            "clarke_zone":          zone_str,
+            "glucose_category":     cat,
+            "is_ood":               is_ood,
+            "ood_warning":          ood_warn,
         })
 
-    # ── Display prediction results (same UI block as dashboard.py style) ──────
-    _render_prediction_output(result, patient_name_input, ts_dt)
+        if patch_ok:
+            st.success("✅ Results uploaded — the ESP32 display will update within 5 seconds.")
+        else:
+            st.warning("Prediction complete but Supabase update failed. Results shown below.")
 
-    st.markdown("---")
+        # Show results on dashboard
+        pipeline_ui(3)
+        _render_result(result, name_in.strip(), ts,
+                       pred_bgl, ci, zone_str, cat, is_ood, ood_warn)
 
-    # ── Trend chart ───────────────────────────────────────────────────────────
-    st.markdown("#### 📈 Patient Reading History")
-    history_df = get_reading_history(sb, patient_name=patient_name_input, limit=30)
+        # Trend chart
+        st.markdown("---")
+        st.markdown("#### 📈 Patient History")
+        hist = get_reading_history(sb, patient_name=name_in.strip(), limit=30)
+        if not hist.empty and "predicted_bgl_mg_dl" in hist.columns:
+            _render_trend(hist)
 
-    if history_df.empty:
-        st.info("No history found. Readings will appear here after the first prediction is stored.")
-    elif "predicted_bgl_mg_dl" not in history_df.columns or history_df["predicted_bgl_mg_dl"].dropna().empty:
-        st.info("Readings exist but have no stored predictions yet — run a prediction first.")
-    else:
-        _render_trend_chart(history_df)
+        st.stop()
+
+    st.stop()
+
 
 # =============================================================================
-# ── MANUAL MODE ───────────────────────────────────────────────────────────────
+# ── MANUAL ENTRY MODE ────────────────────────────────────────────────────────
 # =============================================================================
 else:
-    st.markdown("<div class='manual-badge'>✏️ MANUAL ENTRY MODE</div>", unsafe_allow_html=True)
+    st.markdown("<div class='badge-manual'>✏️ MANUAL ENTRY</div>", unsafe_allow_html=True)
     st.markdown("")
-    st.info(
-        "**Manual Entry** lets you type in sensor values directly — identical to the main dashboard "
-        "(`app/dashboard.py`), which remains untouched.  "
-        "Use this mode for testing or when no ESP32 is connected."
-    )
 
-    with st.form("manual_sensor_form"):
+    with st.sidebar:
+        st.markdown("### 🧑‍⚕️ Patient Context")
+        sid_name    = st.text_input("Name", placeholder="Jane Doe")
+        sid_age     = st.number_input("Age", 18, 100, 45)
+        sid_gender  = st.selectbox("Gender", ["Male", "Female"])
+        sid_h       = st.number_input("Height (cm)", 100.0, 220.0, 170.0, 0.5)
+        sid_w       = st.number_input("Weight (kg)",  30.0, 200.0,  70.0, 0.5)
+        sid_bmi     = round(sid_w / ((sid_h / 100) ** 2), 1)
+        st.markdown(f"**BMI:** {sid_bmi}")
+        sid_diag    = st.selectbox("Diagnosis",
+                                   ["None / Unknown","Prediabetes","Type 1 Diabetes","Type 2 Diabetes"])
+        sid_fast    = st.selectbox("Fasting", ["Fasting", "Non-Fasting"])
+        sid_ins     = st.checkbox("Insulin")
+        sid_oral    = st.checkbox("Oral meds")
+        sid_fam     = st.checkbox("Family history")
+        sid_smoke   = st.checkbox("Smoker")
+        st.caption("⚠️ Research prototype. Not for clinical use.")
+
+    diag_map = {"None / Unknown":"None","Prediabetes":"Prediabetes",
+                "Type 1 Diabetes":"Type 1","Type 2 Diabetes":"Type 2"}
+
+    with st.form("manual_form"):
         st.markdown("#### Sensor Readings")
         mc1, mc2, mc3 = st.columns(3)
         with mc1:
-            m_ph    = st.number_input("Saliva pH",           min_value=4.0,  max_value=10.0, value=7.25,     step=0.01)
-            m_hr    = st.number_input("Heart Rate (BPM)",    min_value=30.0, max_value=200.0, value=72.0,    step=0.5)
-            m_temp  = st.number_input("Temperature (°C)",    min_value=34.0, max_value=42.0,  value=36.6,    step=0.1)
+            m_ph   = st.number_input("Saliva pH",        4.0,  10.0,  7.25, 0.01)
+            m_hr   = st.number_input("Heart Rate (BPM)", 30.0, 200.0, 72.0, 0.5)
+            m_tmp  = st.number_input("Temperature (°C)", 34.0,  42.0, 36.6, 0.1)
         with mc2:
-            m_dc    = st.number_input("PPG DC Baseline",     min_value=50000.0, max_value=250000.0, value=175000.0, step=1000.0)
-            m_ac    = st.number_input("PPG AC Amplitude",    min_value=100.0,   max_value=8000.0,   value=1200.0,   step=50.0)
-            m_pi    = st.number_input("Perfusion Index (%)", min_value=0.1,     max_value=10.0,     value=0.69,     step=0.01)
+            m_dc   = st.number_input("PPG DC Baseline",  50000.0, 250000.0, 175000.0, 1000.0)
+            m_ac   = st.number_input("PPG AC Amplitude",   100.0,   8000.0,   1200.0,   50.0)
+            m_pi   = st.number_input("Perfusion Index (%",   0.1,     10.0,      0.69,   0.01)
         with mc3:
-            m_pw    = st.number_input("Pulse Width (ms)",    min_value=100.0, max_value=500.0, value=280.0, step=5.0)
-            m_sdnn  = st.number_input("HRV SDNN (ms)",       min_value=0.0,   max_value=200.0, value=42.0,  step=1.0)
-            m_rmssd = st.number_input("HRV RMSSD (ms)",      min_value=0.0,   max_value=200.0, value=34.0,  step=1.0)
+            m_pw   = st.number_input("Pulse Width (ms)", 100.0, 500.0, 280.0, 5.0)
+            m_sdnn = st.number_input("HRV SDNN (ms)",      0.0, 200.0,  42.0, 1.0)
+            m_rmss = st.number_input("HRV RMSSD (ms)",     0.0, 200.0,  34.0, 1.0)
+        ok = st.form_submit_button("⚡ Run Prediction", type="primary",
+                                   use_container_width=True)
 
-        ref_bgl = st.number_input(
-            "Reference / Fingerstick BGL (mg/dL, optional — for Clarke zone validation)",
-            min_value=0.0, max_value=600.0, value=0.0, step=1.0,
-        )
-        submitted = st.form_submit_button("⚡ Run Prediction", type="primary")
-
-    if submitted:
-        manual_payload: Dict[str, Any] = {**demo_context,
-            "saliva_ph":           m_ph,
-            "hr_bpm":              m_hr,
-            "temperature_c":       m_temp,
-            "ppg_raw_dc_baseline": m_dc,
-            "ppg_raw_ac_p2p":      m_ac,
-            "perfusion_index":     m_pi,
-            "pulse_width_ms":      m_pw,
-            "hrv_sdnn":            m_sdnn,
-            "hrv_rmssd":           m_rmssd,
+    if ok:
+        payload = {
+            "age": float(sid_age), "bmi": float(sid_bmi),
+            "gender": sid_gender.lower(),
+            "diabetes_diagnosis": diag_map[sid_diag],
+            "fasting": 1 if sid_fast == "Fasting" else 0,
+            "med_taking_insulin": int(sid_ins), "med_taking_oral": int(sid_oral),
+            "med_taking_any": int(sid_ins or sid_oral),
+            "family_history": int(sid_fam), "smoking": int(sid_smoke),
+            "saliva_ph": m_ph, "hr_bpm": m_hr, "temperature_c": m_tmp,
+            "ppg_raw_dc_baseline": m_dc, "ppg_raw_ac_p2p": m_ac,
+            "perfusion_index": m_pi, "pulse_width_ms": m_pw,
+            "hrv_sdnn": m_sdnn, "hrv_rmssd": m_rmss,
         }
-        if ref_bgl > 0:
-            manual_payload["reference_bgl_mg_dl"] = ref_bgl
-
         with st.spinner("Running inference…"):
-            result = predictor.predict_full_sensor(manual_payload)
+            result = predictor.predict_full_sensor(payload)
 
-        _render_prediction_output(result, patient_name_input, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+        pred_bgl = result.get("predicted_bgl_mg_dl", 0.0)
+        ci       = result.get("confidence_interval_5th_95th", [pred_bgl-20, pred_bgl+20])
+        zone_str = result.get("clarke_zone", "Zone A")
+        is_ood   = result.get("is_out_of_distribution", False)
+        ood_warn = result.get("ood_warning", "")
+        cat      = glucose_category(pred_bgl)
+        ts_now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        _render_result(result, sid_name, ts_now,
+                       pred_bgl, ci, zone_str, cat, is_ood, ood_warn)
 
 
 # =============================================================================
-# ── Shared rendering helpers (used by both modes) ────────────────────────────
+# ── SHARED RENDER HELPERS ────────────────────────────────────────────────────
 # =============================================================================
 
-def _render_prediction_output(result: dict, patient_name: str, timestamp: str):
-    """Display BGL, CI, Clarke zone, OOD warning — same visual style as dashboard.py."""
-    pred_bgl = result.get("predicted_bgl_mg_dl")
-    if pred_bgl is None:
-        # predict() routed to tabular model — no sensor data sufficient
-        risk_band = result.get("risk_band", "unknown")
-        st.warning(f"Insufficient sensor data for BGL prediction. Risk band (demographics only): **{risk_band}**")
-        return
-
-    ci       = result.get("confidence_interval_5th_95th", [pred_bgl - 20, pred_bgl + 20])
-    zone_str = result.get("clarke_zone", "")
-    is_ood   = result.get("is_out_of_distribution", False)
-    ood_warn = result.get("ood_warning", "")
+def _render_result(result: dict, patient_name: str, ts: str,
+                   pred_bgl: float, ci: list, zone_str: str,
+                   cat: str, is_ood: bool, ood_warn: str):
+    """Full results block — same style for both live and manual modes."""
 
     # OOD banner
     if is_ood:
-        st.markdown(
-            f"<div class='ood-banner'>⚠️ <b>OUT-OF-DISTRIBUTION INPUT:</b><br/>{ood_warn}</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f"<div class='ood-warn'>⚠️ <b>Out-of-distribution input</b><br>{ood_warn}</div>",
+                    unsafe_allow_html=True)
 
-    # Main result
     col_bgl, col_ci, col_zone = st.columns(3)
-
-    # Colour by glucose range
-    if pred_bgl < 70:
-        bgl_color = "#ef4444"     # red — hypoglycemia
-    elif pred_bgl < 140:
-        bgl_color = "#22c55e"     # green — normal
-    elif pred_bgl < 180:
-        bgl_color = "#f59e0b"     # amber — elevated
-    else:
-        bgl_color = "#ef4444"     # red — hyperglycemia
+    col_b = bgl_color(pred_bgl)
 
     with col_bgl:
         st.markdown(
             f"<div style='text-align:center'>"
-            f"<div style='font-size:.85rem;color:#94a3b8;text-transform:uppercase;'>"
-            f"Predicted Blood Glucose</div>"
-            f"<div style='font-size:3.0rem;font-weight:800;color:{bgl_color};'>"
-            f"{pred_bgl:.1f}</div>"
-            f"<div style='color:#64748b;font-size:.85rem;'>mg/dL</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+            f"<div style='font-size:.82rem;color:#94a3b8;text-transform:uppercase;'>Predicted BGL</div>"
+            f"<div style='font-size:3.2rem;font-weight:800;color:{col_b};'>{pred_bgl:.1f}</div>"
+            f"<div style='color:#64748b;font-size:.82rem;'>mg/dL</div>"
+            f"<div style='color:#64748b;font-size:.80rem;margin-top:4px;'>{cat}</div>"
+            "</div>", unsafe_allow_html=True)
 
     with col_ci:
-        ci_low, ci_high = ci[0], ci[1]
         st.markdown(
             f"<div style='text-align:center'>"
-            f"<div style='font-size:.85rem;color:#94a3b8;text-transform:uppercase;'>"
-            f"90% Confidence Interval</div>"
-            f"<div style='font-size:1.8rem;font-weight:700;color:#f1f5f9;'>"
-            f"{ci_low:.1f} – {ci_high:.1f}</div>"
-            f"<div style='color:#64748b;font-size:.85rem;'>mg/dL</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+            f"<div style='font-size:.82rem;color:#94a3b8;text-transform:uppercase;'>90% CI</div>"
+            f"<div style='font-size:1.9rem;font-weight:700;color:#f1f5f9;'>{ci[0]:.1f} – {ci[1]:.1f}</div>"
+            f"<div style='color:#64748b;font-size:.82rem;'>mg/dL</div>"
+            "</div>", unsafe_allow_html=True)
 
     with col_zone:
-        # Clarke zone colour
-        zone_letter = next((c for c in "ABCDE" if f"Zone {c}" in zone_str), "—")
-        zone_colour = {"A":"#22c55e","B":"#84cc16","C":"#f59e0b","D":"#f97316","E":"#ef4444"}.get(zone_letter,"#94a3b8")
+        zl = next((c for c in "ABCDE" if f"Zone {c}" in zone_str), "A")
+        zc = {"A":"#22c55e","B":"#84cc16","C":"#f59e0b","D":"#f97316","E":"#ef4444"}.get(zl,"#94a3b8")
         st.markdown(
             f"<div style='text-align:center'>"
-            f"<div style='font-size:.85rem;color:#94a3b8;text-transform:uppercase;'>"
-            f"Clarke Zone</div>"
-            f"<div style='font-size:3.0rem;font-weight:800;color:{zone_colour};'>"
-            f"{zone_letter}</div>"
-            f"<div style='color:#64748b;font-size:.80rem;'>{zone_str}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+            f"<div style='font-size:.82rem;color:#94a3b8;text-transform:uppercase;'>Clarke Zone</div>"
+            f"<div style='font-size:3.2rem;font-weight:800;color:{zc};'>{zl}</div>"
+            f"<div style='color:#64748b;font-size:.78rem;'>{zone_str}</div>"
+            "</div>", unsafe_allow_html=True)
 
-    # Confidence interval gauge
-    ci_fig = go.Figure(go.Indicator(
+    # Gauge
+    fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=pred_bgl,
-        number={"suffix": " mg/dL", "font": {"size": 24}},
+        number={"suffix":" mg/dL","font":{"size":22}},
         gauge={
-            "axis": {"range": [40, 400], "tickwidth": 1},
-            "bar": {"color": bgl_color, "thickness": 0.3},
-            "steps": [
-                {"range": [40,  70],  "color": "#fca5a5"},  # hypo
-                {"range": [70,  140], "color": "#bbf7d0"},  # normal
-                {"range": [140, 180], "color": "#fef08a"},  # elevated
-                {"range": [180, 400], "color": "#fca5a5"},  # hyper
+            "axis": {"range":[40,400],"tickwidth":1},
+            "bar":  {"color":col_b,"thickness":0.28},
+            "steps":[
+                {"range":[40,70],   "color":"rgba(239,68,68,.20)"},
+                {"range":[70,100],  "color":"rgba(34,197,94,.18)"},
+                {"range":[100,126], "color":"rgba(245,158,11,.18)"},
+                {"range":[126,180], "color":"rgba(249,115,22,.18)"},
+                {"range":[180,400], "color":"rgba(239,68,68,.20)"},
             ],
-            "threshold": {"line": {"color": "#f1f5f9","width":2},
-                          "thickness": 0.75, "value": pred_bgl},
         },
-        title={"text": f"Confidence interval: {ci_low:.0f}–{ci_high:.0f} mg/dL",
-               "font": {"size": 13, "color": "#94a3b8"}},
+        title={"text":f"CI: {ci[0]:.0f}–{ci[1]:.0f} mg/dL","font":{"size":12,"color":"#94a3b8"}},
     ))
-    ci_fig.update_layout(height=220, margin=dict(t=20,b=10,l=10,r=10),
-                         paper_bgcolor="rgba(0,0,0,0)", font_color="#f1f5f9")
-    st.plotly_chart(ci_fig, use_container_width=True, key=f"gauge_{timestamp}")
+    fig.update_layout(height=200, margin=dict(t=20,b=10,l=10,r=10),
+                      paper_bgcolor="rgba(0,0,0,0)", font_color="#f1f5f9")
+    st.plotly_chart(fig, use_container_width=True, key=f"gauge_{ts}")
 
-    # Glucose range interpretation
+    # Clinical interpretation
     if pred_bgl < 70:
-        st.error("🚨 **Hypoglycemia detected** — BGL below 70 mg/dL. Immediate clinical attention required.")
+        st.error("🚨 Hypoglycemia — below 70 mg/dL. Immediate attention required.")
     elif pred_bgl < 100:
-        st.success("✅ **Normal fasting range** — BGL 70–99 mg/dL.")
+        st.success("✅ Normal fasting range (70–99 mg/dL).")
     elif pred_bgl < 126:
-        st.warning("⚠️ **Prediabetes range** — BGL 100–125 mg/dL. Follow-up HbA1c test recommended.")
+        st.warning("⚠️ Prediabetes range (100–125 mg/dL). HbA1c follow-up recommended.")
     elif pred_bgl < 180:
-        st.warning("⚠️ **Elevated range** — BGL 126–179 mg/dL.")
+        st.warning("⚠️ Elevated (126–179 mg/dL).")
     else:
-        st.error("🚨 **Hyperglycemia** — BGL ≥ 180 mg/dL. Medication review recommended.")
+        st.error("🚨 Hyperglycemia — ≥ 180 mg/dL. Medication review recommended.")
 
-    diag_conf = result.get("diagnosis_stratum_confidence", "")
-    if diag_conf:
-        st.caption(f"ℹ️ {diag_conf}")
-
-    st.caption(
-        f"⚠️ Validation: synthetic-data only — not for clinical use. "
-        f"Patient: {patient_name or '—'} | {timestamp}"
-    )
+    st.caption(f"⚠️ Synthetic-data model — not for clinical use. "
+               f"Patient: {patient_name or '—'} · {ts}")
 
 
-def _render_trend_chart(history_df: pd.DataFrame):
-    """Longitudinal BGL trend from Supabase reading history."""
-    df = history_df.dropna(subset=["predicted_bgl_mg_dl"]).sort_values("created_at")
-    if df.empty:
+def _show_completed_result(row: dict):
+    """Compact display of a completed row's prediction."""
+    bgl  = row.get("predicted_bgl_mg_dl")
+    if bgl is None:
+        st.info("No prediction stored for this row.")
         return
+    col_b = bgl_color(bgl)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Patient",  row.get("patient_name") or "—")
+    c2.markdown(f"<div class='sc'><div class='sl'>BGL</div>"
+                f"<div class='sv' style='color:{col_b}'>{bgl:.1f}<span class='su'>mg/dL</span></div></div>",
+                unsafe_allow_html=True)
+    c3.metric("Clarke Zone", row.get("clarke_zone","—"))
+    c4.metric("Category",    row.get("glucose_category","—"))
+    try:
+        ts = pd.to_datetime(row["created_at"], utc=True).strftime("%Y-%m-%d %H:%M UTC")
+        st.caption(f"Row ID: {row.get('id')} · {ts} · Device: {row.get('device_id','—')}")
+    except Exception:
+        pass
 
+
+def _render_trend(df: pd.DataFrame):
+    df2 = df.dropna(subset=["predicted_bgl_mg_dl"]).sort_values("created_at")
+    if df2.empty:
+        return
+    col_b = bgl_color(df2["predicted_bgl_mg_dl"].iloc[-1])
     fig = go.Figure()
-
-    # Background zones
-    for y0, y1, colour, label in [
-        (40,  70,  "rgba(252,165,165,0.15)", "Hypoglycemia"),
-        (70,  140, "rgba(187,247,208,0.12)", "Normal"),
-        (140, 180, "rgba(254,240,138,0.15)", "Elevated"),
-        (180, 400, "rgba(252,165,165,0.12)", "Hyperglycemia"),
-    ]:
-        fig.add_hrect(y0=y0, y1=y1, fillcolor=colour, line_width=0,
-                      annotation_text=label, annotation_font_size=10,
+    for y0,y1,col,lbl in [(40,70,"rgba(239,68,68,.15)","Hypo"),
+                           (70,100,"rgba(34,197,94,.12)","Normal"),
+                           (100,126,"rgba(245,158,11,.12)","Prediabetes"),
+                           (126,180,"rgba(249,115,22,.12)","Elevated"),
+                           (180,400,"rgba(239,68,68,.12)","Hyper")]:
+        fig.add_hrect(y0=y0,y1=y1,fillcolor=col,line_width=0,
+                      annotation_text=lbl,annotation_font_size=9,
                       annotation_position="top left")
-
-    # BGL line
     fig.add_trace(go.Scatter(
-        x=df["created_at"], y=df["predicted_bgl_mg_dl"],
-        mode="lines+markers",
-        name="Predicted BGL",
-        line=dict(color="#38bdf8", width=2),
-        marker=dict(size=6),
-        hovertemplate="%{x|%H:%M:%S}<br>BGL: %{y:.1f} mg/dL<extra></extra>",
+        x=df2["created_at"], y=df2["predicted_bgl_mg_dl"],
+        mode="lines+markers", name="BGL",
+        line=dict(color="#38bdf8",width=2), marker=dict(size=6),
+        hovertemplate="%{x|%H:%M:%S}<br>%{y:.1f} mg/dL<extra></extra>",
     ))
-
-    # OOD points
-    ood_df = df[df.get("is_ood", False) == True] if "is_ood" in df.columns else pd.DataFrame()
-    if not ood_df.empty:
-        fig.add_trace(go.Scatter(
-            x=ood_df["created_at"], y=ood_df["predicted_bgl_mg_dl"],
-            mode="markers", name="OOD flagged",
-            marker=dict(color="#f97316", size=10, symbol="x"),
-        ))
-
     fig.update_layout(
         title="Glucose Prediction History",
-        xaxis_title="Time",
-        yaxis_title="Predicted BGL (mg/dL)",
-        yaxis=dict(range=[40, 400]),
-        legend=dict(orientation="h", y=-0.2),
-        height=380,
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(15,23,42,0.8)",
-        font_color="#f1f5f9",
-        margin=dict(t=40, b=20),
+        xaxis_title="Time", yaxis_title="Predicted BGL (mg/dL)",
+        yaxis=dict(range=[40,400]),
+        height=350, paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(15,23,42,0.8)", font_color="#f1f5f9",
+        margin=dict(t=40,b=20),
     )
     st.plotly_chart(fig, use_container_width=True)
