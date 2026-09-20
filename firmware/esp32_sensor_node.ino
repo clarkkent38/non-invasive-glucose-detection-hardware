@@ -101,7 +101,7 @@
 #include <ArduinoJson.h>
 #include "MAX30105.h"
 #include "heartRate.h"
-#include <SparkFunTMP117.h>
+#include <SparkFun_TMP117.h>      // Library: "SparkFun TMP117" by SparkFun Electronics
 #include <algorithm>
 
 #ifdef DISPLAY_OLED
