@@ -24,3 +24,6 @@ data/manual_test_log.csv
 .idea/
 .DS_Store
 *.log
+
+# Streamlit secrets — never commit real credentials
+.streamlit/secrets.toml
